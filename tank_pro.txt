@@ -1,0 +1,499 @@
+#include <ai/Game.h>
+#include <ai/AI.h>
+#include <time.h>
+#include <cmath>
+#include <algorithm>
+#include <queue>
+#include <map>
+
+// Tính khoảng cách
+float Distance(float x1, float y1, float x2, float y2) {
+    return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+}
+
+// Kiểm tra ô có đi được không (bỏ qua soft obstacle vì có thể bắn phá)
+bool CanMove(AI* p_AI, int x, int y) {
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return false;
+
+    int block = p_AI->GetBlock(x, y);
+    return (block == BLOCK_GROUND);
+}
+
+// Kiểm tra có chướng ngại vật cản đường không (tank SỐNG, base, hard obstacle)
+bool IsBlocked(AI* p_AI, int x, int y) {
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return true;
+
+    int block = p_AI->GetBlock(x, y);
+
+    // Tường cứng, nước, base không đi được
+    if (block == BLOCK_HARD_OBSTACLE || block == BLOCK_WATER || block == BLOCK_BASE)
+        return true;
+
+    // CHỈ kiểm tra tank SỐNG (HP > 0), bỏ qua xác tank
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* myTank = p_AI->GetMyTank(i);
+        if (myTank && myTank->GetHP() > 0) {  // CHỈ tank còn sống
+            if ((int)myTank->GetX() == x && (int)myTank->GetY() == y)
+                return true;
+        }
+
+        Tank* enemyTank = p_AI->GetEnemyTank(i);
+        if (enemyTank && enemyTank->GetHP() > 0) {  // CHỈ tank còn sống
+            if ((int)enemyTank->GetX() == x && (int)enemyTank->GetY() == y)
+                return true;
+        }
+    }
+
+    return false;
+}
+
+// Tìm tank địch gần nhất
+Tank* FindNearestEnemy(AI* p_AI, Tank* myTank) {
+    Tank* nearest = NULL;
+    float minDist = 999999;
+
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* enemy = p_AI->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+
+        float dist = Distance(myTank->GetX(), myTank->GetY(),
+            enemy->GetX(), enemy->GetY());
+
+        if (dist < minDist) {
+            minDist = dist;
+            nearest = enemy;
+        }
+    }
+
+    return nearest;
+}
+
+// BFS tìm đường ngắn nhất tránh chướng ngại vật
+struct Node {
+    int x, y, dist, dir;
+};
+
+int FindPathDirection(AI* p_AI, Tank* myTank, float targetX, float targetY) {
+    int startX = (int)myTank->GetX();
+    int startY = (int)myTank->GetY();
+    int endX = (int)targetX;
+    int endY = (int)targetY;
+
+    // BFS
+    bool visited[MAP_W][MAP_H] = { false };
+    std::queue<Node> q;
+    std::map<std::pair<int, int>, int> firstDir;
+
+    q.push({ startX, startY, 0, -1 });
+    visited[startX][startY] = true;
+
+    int dx[] = { 0, 1, 0, -1 };
+    int dy[] = { -1, 0, 1, 0 };
+    int dirs[] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+
+    while (!q.empty()) {
+        Node curr = q.front();
+        q.pop();
+
+        // Tìm thấy đích
+        if (curr.x == endX && curr.y == endY) {
+            auto key = std::make_pair(curr.x, curr.y);
+            if (firstDir.find(key) != firstDir.end()) {
+                return firstDir[key];
+            }
+        }
+
+        // Duyệt 4 hướng
+        for (int i = 0; i < 4; i++) {
+            int nx = curr.x + dx[i];
+            int ny = curr.y + dy[i];
+
+            if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H)
+                continue;
+
+            if (visited[nx][ny])
+                continue;
+
+            // Chỉ đi qua ô ground hoặc soft obstacle (có thể phá)
+            int block = p_AI->GetBlock(nx, ny);
+            bool canPass = (block == BLOCK_GROUND || block == BLOCK_SOFT_OBSTACLE);
+
+            // XÁC TANK CHẾT có thể đi qua (không cần kiểm tra IsBlocked cho xác)
+            // CHỈ tránh tank SỐNG và base
+            if (canPass) {
+                // Kiểm tra có tank SỐNG ở vị trí này không
+                bool hasTankAlive = false;
+                for (int j = 0; j < NUMBER_OF_TANK; j++) {
+                    Tank* t1 = p_AI->GetMyTank(j);
+                    if (t1 && t1->GetHP() > 0 && (int)t1->GetX() == nx && (int)t1->GetY() == ny) {
+                        hasTankAlive = true;
+                        break;
+                    }
+                    Tank* t2 = p_AI->GetEnemyTank(j);
+                    if (t2 && t2->GetHP() > 0 && (int)t2->GetX() == nx && (int)t2->GetY() == ny) {
+                        hasTankAlive = true;
+                        break;
+                    }
+                }
+
+                // Kiểm tra có base không
+                if (block == BLOCK_BASE)
+                    hasTankAlive = true;
+
+                if (!hasTankAlive) {
+                    visited[nx][ny] = true;
+                    int newDir = (curr.dist == 0) ? dirs[i] : curr.dir;
+                    q.push({ nx, ny, curr.dist + 1, newDir });
+
+                    auto key = std::make_pair(nx, ny);
+                    if (firstDir.find(key) == firstDir.end()) {
+                        firstDir[key] = newDir;
+                    }
+                }
+            }
+        }
+    }
+
+    // Không tìm thấy đường - thử hướng gần nhất (BỎ QUA XÁC TANK)
+    float myX = myTank->GetX();
+    float myY = myTank->GetY();
+    float minDist = 999999;
+    int bestDir = myTank->GetDirection();
+
+    for (int i = 0; i < 4; i++) {
+        int nx = startX + dx[i];
+        int ny = startY + dy[i];
+
+        // Kiểm tra ô có đi được không
+        if (nx >= 0 && nx < MAP_W && ny >= 0 && ny < MAP_H) {
+            int block = p_AI->GetBlock(nx, ny);
+            bool canGo = (block == BLOCK_GROUND || block == BLOCK_SOFT_OBSTACLE);
+
+            // Chỉ tránh tank SỐNG
+            bool blocked = false;
+            for (int j = 0; j < NUMBER_OF_TANK; j++) {
+                Tank* t1 = p_AI->GetMyTank(j);
+                if (t1 && t1->GetHP() > 0 && (int)t1->GetX() == nx && (int)t1->GetY() == ny) {
+                    blocked = true;
+                    break;
+                }
+                Tank* t2 = p_AI->GetEnemyTank(j);
+                if (t2 && t2->GetHP() > 0 && (int)t2->GetX() == nx && (int)t2->GetY() == ny) {
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if (canGo && !blocked) {
+                float dist = Distance(nx, ny, targetX, targetY);
+                if (dist < minDist) {
+                    minDist = dist;
+                    bestDir = dirs[i];
+                }
+            }
+        }
+    }
+
+    return bestDir;
+}
+
+// Kiểm tra có đang ngắm đúng địch không
+bool IsAimingAtEnemy(Tank* myTank, Tank* enemy) {
+    if (!myTank || !enemy) return false;
+
+    float myX = myTank->GetX();
+    float myY = myTank->GetY();
+    float enemyX = enemy->GetX();
+    float enemyY = enemy->GetY();
+    int dir = myTank->GetDirection();
+
+    float tolerance = 1.0f;
+
+    switch (dir) {
+    case DIRECTION_UP:
+        return (abs(myX - enemyX) < tolerance && enemyY < myY);
+    case DIRECTION_RIGHT:
+        return (abs(myY - enemyY) < tolerance && enemyX > myX);
+    case DIRECTION_DOWN:
+        return (abs(myX - enemyX) < tolerance && enemyY > myY);
+    case DIRECTION_LEFT:
+        return (abs(myY - enemyY) < tolerance && enemyX < myX);
+    }
+
+    return false;
+}
+
+// Tìm hướng để ngắm vào mục tiêu
+int GetAimDirection(float myX, float myY, float targetX, float targetY) {
+    float dx = targetX - myX;
+    float dy = targetY - myY;
+
+    if (abs(dx) > abs(dy)) {
+        return (dx > 0) ? DIRECTION_RIGHT : DIRECTION_LEFT;
+    }
+    else {
+        return (dy > 0) ? DIRECTION_DOWN : DIRECTION_UP;
+    }
+}
+
+// Kiểm tra có soft obstacle phía trước không
+bool HasSoftObstacleAhead(AI* p_AI, Tank* myTank) {
+    int x = (int)myTank->GetX();
+    int y = (int)myTank->GetY();
+    int dir = myTank->GetDirection();
+
+    switch (dir) {
+    case DIRECTION_UP: y--; break;
+    case DIRECTION_RIGHT: x++; break;
+    case DIRECTION_DOWN: y++; break;
+    case DIRECTION_LEFT: x--; break;
+    }
+
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return false;
+
+    return (p_AI->GetBlock(x, y) == BLOCK_SOFT_OBSTACLE);
+}
+
+void AI_Placement() {
+    AI* p_AI = AI::GetInstance();
+
+    if (p_AI->GetMyTeam() == TEAM_1) {
+        Game::PlaceTank(TANK_LIGHT, 1, 6);
+        Game::PlaceTank(TANK_LIGHT, 7, 7);
+        Game::PlaceTank(TANK_LIGHT, 2, 14);
+        Game::PlaceTank(TANK_LIGHT, 5, 18);
+    }
+    else if (p_AI->GetMyTeam() == TEAM_2) {
+        Game::PlaceTank(TANK_LIGHT, 20, 1);
+        Game::PlaceTank(TANK_LIGHT, 17, 7);
+        Game::PlaceTank(TANK_LIGHT, 16, 15);
+        Game::PlaceTank(TANK_LIGHT, 16, 20);
+    }
+}
+
+void AI_Update() {
+    AI* p_AI = AI::GetInstance();
+
+    // Biến lưu trạng thái
+    static int stuckCounter[NUMBER_OF_TANK] = { 0 };
+    static float lastX[NUMBER_OF_TANK] = { 0 };
+    static float lastY[NUMBER_OF_TANK] = { 0 };
+    static int alternatePathTimer[NUMBER_OF_TANK] = { 0 };
+
+    // Kiểm tra strike nguy hiểm
+    std::vector<Strike*> strikes = p_AI->GetIncomingStrike();
+    bool inDanger[NUMBER_OF_TANK] = { false };
+
+    for (auto strike : strikes) {
+        if (!strike->IsAlive() || strike->GetCountDown() > 15) continue;
+
+        for (int i = 0; i < NUMBER_OF_TANK; i++) {
+            Tank* tank = p_AI->GetMyTank(i);
+            if (!tank || tank->GetHP() <= 0) continue;
+
+            float dist = Distance(tank->GetX(), tank->GetY(),
+                strike->GetX(), strike->GetY());
+
+            if (dist < 4.0f) {
+                inDanger[i] = true;
+            }
+        }
+    }
+
+    // Điều khiển từng tank
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* myTank = p_AI->GetMyTank(i);
+
+        if (!myTank || myTank->GetHP() <= 0 || myTank->IsDisabled()) {
+            continue;
+        }
+
+        alternatePathTimer[i]++;
+
+        // TRÁNH STRIKE
+        if (inDanger[i]) {
+            for (auto strike : strikes) {
+                if (!strike->IsAlive()) continue;
+
+                float dx = myTank->GetX() - strike->GetX();
+                float dy = myTank->GetY() - strike->GetY();
+
+                int escapeDir;
+                if (abs(dx) > abs(dy)) {
+                    escapeDir = (dx > 0) ? DIRECTION_RIGHT : DIRECTION_LEFT;
+                }
+                else {
+                    escapeDir = (dy > 0) ? DIRECTION_DOWN : DIRECTION_UP;
+                }
+
+                Game::CommandTank(i, escapeDir, true, false);
+                break;
+            }
+            continue;
+        }
+
+        // Kiểm tra tank có bị kẹt không
+        float moveDistance = Distance(myTank->GetX(), myTank->GetY(), lastX[i], lastY[i]);
+        if (moveDistance < 0.1f) {
+            stuckCounter[i]++;
+        }
+        else {
+            stuckCounter[i] = 0;
+        }
+        lastX[i] = myTank->GetX();
+        lastY[i] = myTank->GetY();
+
+        // Tìm địch gần nhất
+        Tank* target = FindNearestEnemy(p_AI, myTank);
+
+        if (!target) {
+            int dir = FindPathDirection(p_AI, myTank, MAP_W / 2.0f, MAP_H / 2.0f);
+            Game::CommandTank(i, dir, true, false);
+            continue;
+        }
+
+        float distToEnemy = Distance(myTank->GetX(), myTank->GetY(),
+            target->GetX(), target->GetY());
+
+        bool isAiming = IsAimingAtEnemy(myTank, target);
+        bool canShoot = (myTank->GetCoolDown() == 0);
+
+        // NẾU BỊ KẸT QUÁ 8 FRAME - TÌM ĐƯỜNG VÒNG
+        if (stuckCounter[i] > 8) {
+            // Tìm đường vòng bằng BFS
+            int newDir = FindPathDirection(p_AI, myTank, target->GetX(), target->GetY());
+
+            // Nếu có soft obstacle phía trước, bắn phá
+            bool shouldShoot = HasSoftObstacleAhead(p_AI, myTank) && canShoot;
+
+            Game::CommandTank(i, newDir, true, shouldShoot);
+
+            // Reset counter sau 15 frame
+            if (stuckCounter[i] > 15) {
+                stuckCounter[i] = 0;
+            }
+            continue;
+        }
+
+        // CHIẾN THUẬT THEO KHOẢNG CÁCH
+        if (distToEnemy < 2.5f) {
+            // QUÁ GẦN - NGẮM VÀ BẮN
+            int aimDir = GetAimDirection(myTank->GetX(), myTank->GetY(),
+                target->GetX(), target->GetY());
+            Game::CommandTank(i, aimDir, false, canShoot);
+        }
+        else if (distToEnemy < 8.0f) {
+            // KHOẢNG CÁCH TỐT
+            if (isAiming) {
+                if (canShoot) {
+                    Game::CommandTank(i, myTank->GetDirection(), false, true);
+                }
+                else {
+                    Game::CommandTank(i, myTank->GetDirection(), true, false);
+                }
+            }
+            else {
+                int aimDir = GetAimDirection(myTank->GetX(), myTank->GetY(),
+                    target->GetX(), target->GetY());
+                Game::CommandTank(i, aimDir, false, false);
+            }
+        }
+        else {
+            // XA - DI CHUYỂN ĐẾN GẦN với pathfinding
+            int moveDir = FindPathDirection(p_AI, myTank, target->GetX(), target->GetY());
+
+            // Bắn phá soft obstacle nếu có
+            bool shouldShoot = HasSoftObstacleAhead(p_AI, myTank) && canShoot;
+
+            Game::CommandTank(i, moveDir, true, shouldShoot);
+        }
+    }
+
+    // SỬ DỤNG POWER-UP
+    if (p_AI->HasAirstrike()) {
+        float bestX = 0, bestY = 0;
+        int maxTanks = 0;
+
+        for (int i = 0; i < NUMBER_OF_TANK; i++) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+
+            int nearbyCount = 0;
+            for (int j = 0; j < NUMBER_OF_TANK; j++) {
+                Tank* other = p_AI->GetEnemyTank(j);
+                if (!other || other->GetHP() <= 0 || i == j) continue;
+
+                float dist = Distance(enemy->GetX(), enemy->GetY(),
+                    other->GetX(), other->GetY());
+                if (dist < 3.5f) nearbyCount++;
+            }
+
+            if (nearbyCount > maxTanks) {
+                maxTanks = nearbyCount;
+                bestX = enemy->GetX();
+                bestY = enemy->GetY();
+            }
+        }
+
+        if (maxTanks > 0 || bestX != 0) {
+            p_AI->UseAirstrike(bestX, bestY);
+        }
+    }
+    else if (p_AI->HasEMP()) {
+        Tank* strongest = NULL;
+        int maxHP = 0;
+
+        for (int i = 0; i < NUMBER_OF_TANK; i++) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+
+            if (enemy->GetHP() > maxHP) {
+                maxHP = enemy->GetHP();
+                strongest = enemy;
+            }
+        }
+
+        if (strongest) {
+            p_AI->UseEMP(strongest->GetX(), strongest->GetY());
+        }
+    }
+
+    Game::GetInstance()->SendCommand();
+}
+
+int main(int argc, char* argv[]) {
+    srand(time(NULL));
+
+#ifdef _WIN32
+    INT rc;
+    WSADATA wsaData;
+    rc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (rc) {
+        printf("WSAStartup Failed.\n");
+        return 1;
+    }
+#endif
+
+    Game::CreateInstance();
+    Game* p_Game = Game::GetInstance();
+
+    if (p_Game->Connect(argc, argv) == -1) {
+        LOG("Failed to connect to server!\n");
+        return -1;
+    }
+
+    AI::GetInstance()->PlaceTank = &AI_Placement;
+    AI::GetInstance()->Update = &AI_Update;
+
+    p_Game->PollingFromServer();
+
+    Game::DestroyInstance();
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
+}

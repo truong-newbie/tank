@@ -1,0 +1,1150 @@
+#include <ai/Game.h>
+#include <ai/AI.h>
+#include <time.h>
+#include <cmath>
+#include <algorithm>
+#include <queue>
+#include <map>
+#include <set>
+#include <vector>
+
+float Distance(float x1, float y1, float x2, float y2) {
+    return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+}
+
+// Kiểm tra có tường đen chặn không
+bool HasHardObstacleBetween(AI* p_AI, float x1, float y1, float x2, float y2) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float dist = sqrt(dx * dx + dy * dy);
+
+    if (dist < 0.1f) return false;
+
+    int steps = (int)(dist * 2);
+    for (int i = 1; i < steps; i++) {
+        float t = (float)i / steps;
+        int checkX = (int)(x1 + dx * t);
+        int checkY = (int)(y1 + dy * t);
+
+        if (checkX >= 0 && checkX < MAP_W && checkY >= 0 && checkY < MAP_H) {
+            int block = p_AI->GetBlock(checkX, checkY);
+            if (block == BLOCK_HARD_OBSTACLE || block == BLOCK_WATER) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Kiểm tra có thể bắn trúng địch không - CẢI TIẾN: Tầm ngắm XA và RỘNG
+bool CanShootEnemy(AI* p_AI, Tank* myTank, Tank* enemy, float customTolerance = 2.5f) {
+    if (!myTank || !enemy) return false;
+
+    float myX = myTank->GetX();
+    float myY = myTank->GetY();
+    float enemyX = enemy->GetX();
+    float enemyY = enemy->GetY();
+    int dir = myTank->GetDirection();
+
+    // Tăng tolerance để DỄ BẮN HƠN NHIỀU
+    float tolerance = customTolerance;
+
+    switch (dir) {
+    case DIRECTION_UP:
+        if (abs(myX - enemyX) < tolerance && enemyY < myY) {
+            return !HasHardObstacleBetween(p_AI, myX, myY, enemyX, enemyY);
+        }
+        break;
+    case DIRECTION_RIGHT:
+        if (abs(myY - enemyY) < tolerance && enemyX > myX) {
+            return !HasHardObstacleBetween(p_AI, myX, myY, enemyX, enemyY);
+        }
+        break;
+    case DIRECTION_DOWN:
+        if (abs(myX - enemyX) < tolerance && enemyY > myY) {
+            return !HasHardObstacleBetween(p_AI, myX, myY, enemyX, enemyY);
+        }
+        break;
+    case DIRECTION_LEFT:
+        if (abs(myY - enemyY) < tolerance && enemyX < myX) {
+            return !HasHardObstacleBetween(p_AI, myX, myY, enemyX, enemyY);
+        }
+        break;
+    }
+
+    return false;
+}
+
+bool HasSoftObstacleAhead(AI* p_AI, Tank* myTank) {
+    int x = (int)myTank->GetX();
+    int y = (int)myTank->GetY();
+    int dir = myTank->GetDirection();
+
+    switch (dir) {
+    case DIRECTION_UP: y--; break;
+    case DIRECTION_RIGHT: x++; break;
+    case DIRECTION_DOWN: y++; break;
+    case DIRECTION_LEFT: x--; break;
+    }
+
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return false;
+
+    return (p_AI->GetBlock(x, y) == BLOCK_SOFT_OBSTACLE);
+}
+
+bool HasHardObstacleAhead(AI* p_AI, Tank* myTank) {
+    int x = (int)myTank->GetX();
+    int y = (int)myTank->GetY();
+    int dir = myTank->GetDirection();
+
+    switch (dir) {
+    case DIRECTION_UP: y--; break;
+    case DIRECTION_RIGHT: x++; break;
+    case DIRECTION_DOWN: y++; break;
+    case DIRECTION_LEFT: x--; break;
+    }
+
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return true;
+
+    int block = p_AI->GetBlock(x, y);
+    return (block == BLOCK_HARD_OBSTACLE || block == BLOCK_WATER || block == BLOCK_BASE);
+}
+
+bool HasWaterOrWallAhead(AI* p_AI, Tank* myTank) {
+    return HasHardObstacleAhead(p_AI, myTank);
+}
+
+// PHÁT HIỆN ĐẠN NGUY HIỂM - CẢI TIẾN
+struct DangerBullet {
+    Bullet* bullet;
+    float distance;
+    float timeToHit;
+    int escapeDir;
+    bool canShootWhileDodge; // MỚI: Có thể bắn trong khi né không
+};
+
+std::vector<DangerBullet> DetectDangerousBullets(AI* p_AI, Tank* myTank) {
+    std::vector<DangerBullet> dangers;
+    std::vector<Bullet*> enemyBullets = p_AI->GetEnemyBullets();
+
+    float myX = myTank->GetX();
+    float myY = myTank->GetY();
+
+    for (auto bullet : enemyBullets) {
+        if (!bullet || !bullet->IsAlive()) continue;
+
+        float bx = bullet->GetX();
+        float by = bullet->GetY();
+        int bdir = bullet->GetDirection();
+        float speed = bullet->GetSpeed();
+
+        float futureBX = bx;
+        float futureBY = by;
+
+        // Mô phỏng 20 frame tới (tăng lên để phát hiện sớm hơn)
+        for (int t = 1; t <= 20; t++) {
+            switch (bdir) {
+            case DIRECTION_UP: futureBY -= speed; break;
+            case DIRECTION_RIGHT: futureBX += speed; break;
+            case DIRECTION_DOWN: futureBY += speed; break;
+            case DIRECTION_LEFT: futureBX -= speed; break;
+            }
+
+            float dist = Distance(myX, myY, futureBX, futureBY);
+
+            // Đạn sẽ trúng trong 1.8 ô
+            if (dist < 1.8f) {
+                DangerBullet danger;
+                danger.bullet = bullet;
+                danger.distance = dist;
+                danger.timeToHit = t;
+
+                // Tính hướng tránh tốt nhất
+                float dx = myX - futureBX;
+                float dy = myY - futureBY;
+
+                // Tránh vuông góc với hướng đạn
+                if (bdir == DIRECTION_UP || bdir == DIRECTION_DOWN) {
+                    danger.escapeDir = (dx > 0) ? DIRECTION_RIGHT : DIRECTION_LEFT;
+                }
+                else {
+                    danger.escapeDir = (dy > 0) ? DIRECTION_DOWN : DIRECTION_UP;
+                }
+
+                // MỚI: Kiểm tra có thể bắn trong khi né không
+                // Nếu đạn còn xa (> 10 frame), có thể vừa né vừa bắn
+                danger.canShootWhileDodge = (t > 10);
+
+                dangers.push_back(danger);
+                break;
+            }
+        }
+    }
+
+    return dangers;
+}
+
+// TÌM ĐỊCH THÔNG MINH
+Tank* FindBestEnemyTarget(AI* p_AI, Tank* myTank) {
+    Tank* bestTarget = NULL;
+    float bestScore = -999999;
+
+    float myX = myTank->GetX();
+    float myY = myTank->GetY();
+
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* enemy = p_AI->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+
+        float dist = Distance(myX, myY, enemy->GetX(), enemy->GetY());
+        bool hasWall = HasHardObstacleBetween(p_AI, myX, myY,
+            enemy->GetX(), enemy->GetY());
+
+        float score = 0;
+        score += (20.0f - dist) * 5.0f;
+        score += (10 - enemy->GetHP()) * 5.0f;
+        if (!hasWall) score += 100.0f;
+
+        std::vector<Base*> myBases = p_AI->GetMyBases();
+        for (auto base : myBases) {
+            float distToBase = Distance(enemy->GetX(), enemy->GetY(),
+                base->GetX(), base->GetY());
+            if (distToBase < 5.0f) {
+                score += 80.0f;
+                break;
+            }
+        }
+
+        if (dist < 8.0f && !hasWall) {
+            score += 120.0f;
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestTarget = enemy;
+        }
+    }
+
+    return bestTarget;
+}
+
+Tank* FindNearestEnemy(AI* p_AI, Tank* myTank) {
+    Tank* nearest = NULL;
+    float minDist = 999999;
+
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* enemy = p_AI->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+
+        float dist = Distance(myTank->GetX(), myTank->GetY(),
+            enemy->GetX(), enemy->GetY());
+
+        if (dist < minDist) {
+            minDist = dist;
+            nearest = enemy;
+        }
+    }
+
+    return nearest;
+}
+
+struct LastSeenInfo {
+    float x, y;
+    int framesSince;
+    bool valid;
+};
+
+int GetDirectionToTarget(float myX, float myY, float targetX, float targetY) {
+    float dx = targetX - myX;
+    float dy = targetY - myY;
+
+    if (abs(dx) > abs(dy)) {
+        return (dx > 0) ? DIRECTION_RIGHT : DIRECTION_LEFT;
+    }
+    else {
+        return (dy > 0) ? DIRECTION_DOWN : DIRECTION_UP;
+    }
+}
+
+bool CanMoveInDirection(AI* p_AI, Tank* myTank, int direction) {
+    int x = (int)myTank->GetX();
+    int y = (int)myTank->GetY();
+
+    switch (direction) {
+    case DIRECTION_UP: y--; break;
+    case DIRECTION_RIGHT: x++; break;
+    case DIRECTION_DOWN: y++; break;
+    case DIRECTION_LEFT: x--; break;
+    }
+
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H)
+        return false;
+
+    int block = p_AI->GetBlock(x, y);
+    if (block == BLOCK_HARD_OBSTACLE || block == BLOCK_WATER || block == BLOCK_BASE)
+        return false;
+
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* t1 = p_AI->GetMyTank(i);
+        if (t1 && t1->GetHP() > 0 && (int)t1->GetX() == x && (int)t1->GetY() == y)
+            return false;
+
+        Tank* t2 = p_AI->GetEnemyTank(i);
+        if (t2 && t2->GetHP() > 0 && (int)t2->GetX() == x && (int)t2->GetY() == y)
+            return false;
+    }
+
+    return true;
+}
+
+// MỚI: TÍNH ĐIỂM CHO HƯỚNG TRÁNH DỰA TRÊN KHẢ NĂNG BẮN
+struct DodgeOption {
+    int direction;
+    float safetyScore;
+    bool canShootEnemy;
+    float distanceToEnemy;
+};
+
+std::vector<DodgeOption> EvaluateDodgeOptions(AI* p_AI, Tank* myTank, Tank* target, int primaryDodgeDir) {
+    std::vector<DodgeOption> options;
+    
+    int allDirs[] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    
+    for (int dir : allDirs) {
+        if (!CanMoveInDirection(p_AI, myTank, dir)) continue;
+        
+        DodgeOption opt;
+        opt.direction = dir;
+        opt.safetyScore = 0;
+        opt.canShootEnemy = false;
+        opt.distanceToEnemy = 999;
+        
+        // Điểm an toàn: hướng né chính được điểm cao nhất
+        if (dir == primaryDodgeDir) {
+            opt.safetyScore += 100;
+        }
+        
+        // Nếu có địch, tính điểm bắn
+        if (target) {
+            // Mô phỏng vị trí sau khi di chuyển
+            float newX = myTank->GetX();
+            float newY = myTank->GetY();
+            
+            switch (dir) {
+            case DIRECTION_UP: newY -= 0.5f; break;
+            case DIRECTION_RIGHT: newX += 0.5f; break;
+            case DIRECTION_DOWN: newY += 0.5f; break;
+            case DIRECTION_LEFT: newX -= 0.5f; break;
+            }
+            
+            float targetX = target->GetX();
+            float targetY = target->GetY();
+            opt.distanceToEnemy = Distance(newX, newY, targetX, targetY);
+            
+            // Kiểm tra có thể bắn địch khi đi theo hướng này không
+            float tolerance = 1.5f;
+            bool aligned = false;
+            
+            switch (dir) {
+            case DIRECTION_UP:
+                aligned = (abs(newX - targetX) < tolerance && targetY < newY);
+                break;
+            case DIRECTION_RIGHT:
+                aligned = (abs(newY - targetY) < tolerance && targetX > newX);
+                break;
+            case DIRECTION_DOWN:
+                aligned = (abs(newX - targetX) < tolerance && targetY > newY);
+                break;
+            case DIRECTION_LEFT:
+                aligned = (abs(newY - targetY) < tolerance && targetX < newX);
+                break;
+            }
+            
+            if (aligned && !HasHardObstacleBetween(p_AI, newX, newY, targetX, targetY)) {
+                opt.canShootEnemy = true;
+                opt.safetyScore += 200; // THƯỞNG CỰC LỚN nếu có thể bắn
+            }
+            
+            // Thưởng nếu giữ khoảng cách tốt với địch (2-10 ô)
+            if (opt.distanceToEnemy >= 2.0f && opt.distanceToEnemy <= 10.0f) {
+                opt.safetyScore += 40;
+            }
+        }
+        
+        options.push_back(opt);
+    }
+    
+    // Sắp xếp theo điểm cao nhất
+    std::sort(options.begin(), options.end(), 
+        [](const DodgeOption& a, const DodgeOption& b) {
+            return a.safetyScore > b.safetyScore;
+        });
+    
+    return options;
+}
+
+struct PatrolPoint {
+    int x, y;
+    int priority;
+};
+
+std::vector<PatrolPoint> GetSmartPatrolPoints(AI* p_AI) {
+    std::vector<PatrolPoint> points;
+
+    points.push_back({ 11, 11, 10 });
+
+    std::vector<PowerUp*> powerUps = p_AI->GetPowerUpList();
+    for (auto pu : powerUps) {
+        if (pu && pu->IsActive()) {
+            points.push_back({ (int)pu->GetX(), (int)pu->GetY(), 9 });
+        }
+    }
+
+    std::vector<Base*> enemyBases = p_AI->GetEnemyBases();
+    for (auto base : enemyBases) {
+        points.push_back({ base->GetX(), base->GetY() - 2, 8 });
+        points.push_back({ base->GetX() + 2, base->GetY(), 8 });
+    }
+
+    points.push_back({ 7, 7, 7 });
+    points.push_back({ 15, 7, 7 });
+    points.push_back({ 7, 15, 7 });
+    points.push_back({ 15, 15, 7 });
+
+    points.push_back({ 5, 11, 6 });
+    points.push_back({ 17, 11, 6 });
+    points.push_back({ 11, 5, 6 });
+    points.push_back({ 11, 17, 6 });
+
+    points.push_back({ 3, 3, 5 });
+    points.push_back({ 19, 3, 5 });
+    points.push_back({ 3, 19, 5 });
+    points.push_back({ 19, 19, 5 });
+
+    return points;
+}
+
+PatrolPoint FindNextPatrolPoint(AI* p_AI, Tank* myTank, std::set<int>& visitedPoints) {
+    std::vector<PatrolPoint> points = GetSmartPatrolPoints(p_AI);
+
+    float bestScore = -999999;
+    PatrolPoint nextPoint = { 11, 11, 10 };
+    int bestIndex = -1;
+
+    for (size_t i = 0; i < points.size(); i++) {
+        if (visitedPoints.count(i) > 0) continue;
+
+        float dist = Distance(myTank->GetX(), myTank->GetY(),
+            points[i].x, points[i].y);
+
+        float score = points[i].priority - dist / 2.0f;
+
+        if (score > bestScore) {
+            bestScore = score;
+            nextPoint = points[i];
+            bestIndex = i;
+        }
+    }
+
+    if (bestIndex == -1) {
+        visitedPoints.clear();
+        bestIndex = 0;
+        nextPoint = points[0];
+    }
+
+    visitedPoints.insert(bestIndex);
+
+    return nextPoint;
+}
+
+struct Node {
+    int x, y, dist;
+    int softCount;
+    float heuristic;
+
+    bool operator>(const Node& other) const {
+        if (softCount != other.softCount)
+            return softCount > other.softCount;
+        return heuristic > other.heuristic;
+    }
+};
+
+int FindDetourDirection(AI* p_AI, Tank* myTank, float targetX, float targetY) {
+    int startX = (int)myTank->GetX();
+    int startY = (int)myTank->GetY();
+    int currDir = myTank->GetDirection();
+
+    int perpDirs[4][3] = {
+        {DIRECTION_LEFT, DIRECTION_RIGHT, DIRECTION_DOWN},
+        {DIRECTION_UP, DIRECTION_DOWN, DIRECTION_LEFT},
+        {DIRECTION_RIGHT, DIRECTION_LEFT, DIRECTION_UP},
+        {DIRECTION_DOWN, DIRECTION_UP, DIRECTION_RIGHT}
+    };
+
+    int dirIndex = (currDir - 1) % 4;
+
+    float bestDist = 999999;
+    int bestDir = currDir;
+
+    for (int i = 0; i < 3; i++) {
+        int testDir = perpDirs[dirIndex][i];
+        int nx = startX, ny = startY;
+
+        switch (testDir) {
+        case DIRECTION_UP: ny--; break;
+        case DIRECTION_RIGHT: nx++; break;
+        case DIRECTION_DOWN: ny++; break;
+        case DIRECTION_LEFT: nx--; break;
+        }
+
+        if (CanMoveInDirection(p_AI, myTank, testDir)) {
+            float dist = Distance(nx, ny, targetX, targetY);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestDir = testDir;
+            }
+        }
+    }
+
+    return bestDir;
+}
+
+int FindBestDirection(AI* p_AI, Tank* myTank, float targetX, float targetY) {
+    int startX = (int)myTank->GetX();
+    int startY = (int)myTank->GetY();
+    int endX = (int)targetX;
+    int endY = (int)targetY;
+
+    if (HasWaterOrWallAhead(p_AI, myTank)) {
+        return FindDetourDirection(p_AI, myTank, targetX, targetY);
+    }
+
+    float dist = Distance(startX, startY, endX, endY);
+    if (dist < 3.0f) {
+        int simpleDir = GetDirectionToTarget(startX, startY, endX, endY);
+        if (CanMoveInDirection(p_AI, myTank, simpleDir))
+            return simpleDir;
+        return FindDetourDirection(p_AI, myTank, targetX, targetY);
+    }
+
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
+    bool visited[MAP_W][MAP_H] = { false };
+    int parent[MAP_W][MAP_H][2];
+
+    for (int i = 0; i < MAP_W; i++)
+        for (int j = 0; j < MAP_H; j++) {
+            parent[i][j][0] = -1;
+            parent[i][j][1] = -1;
+        }
+
+    float startHeuristic = Distance(startX, startY, endX, endY);
+    pq.push({ startX, startY, 0, 0, startHeuristic });
+    visited[startX][startY] = true;
+
+    int dx[] = { 0, 1, 0, -1 };
+    int dy[] = { -1, 0, 1, 0 };
+
+    int nodesChecked = 0;
+    int maxNodes = 150;
+
+    while (!pq.empty() && nodesChecked < maxNodes) {
+        Node curr = pq.top();
+        pq.pop();
+        nodesChecked++;
+
+        if (curr.x == endX && curr.y == endY) {
+            int x = endX, y = endY;
+            while (parent[x][y][0] != -1) {
+                int px = parent[x][y][0];
+                int py = parent[x][y][1];
+                if (px == startX && py == startY) {
+                    if (x > startX) return DIRECTION_RIGHT;
+                    if (x < startX) return DIRECTION_LEFT;
+                    if (y > startY) return DIRECTION_DOWN;
+                    if (y < startY) return DIRECTION_UP;
+                }
+                x = px;
+                y = py;
+            }
+        }
+
+        for (int i = 0; i < 4; i++) {
+            int nx = curr.x + dx[i];
+            int ny = curr.y + dy[i];
+
+            if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H)
+                continue;
+
+            if (visited[nx][ny])
+                continue;
+
+            int block = p_AI->GetBlock(nx, ny);
+            if (block != BLOCK_GROUND && block != BLOCK_SOFT_OBSTACLE)
+                continue;
+
+            bool hasTank = false;
+            for (int j = 0; j < NUMBER_OF_TANK; j++) {
+                Tank* t1 = p_AI->GetMyTank(j);
+                if (t1 && t1->GetHP() > 0 && (int)t1->GetX() == nx && (int)t1->GetY() == ny) {
+                    hasTank = true;
+                    break;
+                }
+                Tank* t2 = p_AI->GetEnemyTank(j);
+                if (t2 && t2->GetHP() > 0 && (int)t2->GetX() == nx && (int)t2->GetY() == ny) {
+                    hasTank = true;
+                    break;
+                }
+            }
+
+            if (!hasTank) {
+                visited[nx][ny] = true;
+                parent[nx][ny][0] = curr.x;
+                parent[nx][ny][1] = curr.y;
+
+                int newSoft = curr.softCount + (block == BLOCK_SOFT_OBSTACLE ? 1 : 0);
+                float h = Distance(nx, ny, endX, endY);
+
+                pq.push({ nx, ny, curr.dist + 1, newSoft, h });
+            }
+        }
+    }
+
+    return FindDetourDirection(p_AI, myTank, targetX, targetY);
+}
+
+void AI_Placement() {
+    AI* p_AI = AI::GetInstance();
+
+    if (p_AI->GetMyTeam() == TEAM_1) {
+        Game::PlaceTank(TANK_LIGHT, 5, 2);
+        Game::PlaceTank(TANK_LIGHT, 5, 6);
+        Game::PlaceTank(TANK_LIGHT, 5, 14);
+        Game::PlaceTank(TANK_LIGHT, 5, 20);
+    }
+    else if (p_AI->GetMyTeam() == TEAM_2) {
+        Game::PlaceTank(TANK_HEAVY, 14, 1);
+        Game::PlaceTank(TANK_HEAVY, 14, 7);
+        Game::PlaceTank(TANK_HEAVY, 14, 14);
+        Game::PlaceTank(TANK_HEAVY, 16, 19);
+    }
+}
+
+void AI_Update() {
+    AI* p_AI = AI::GetInstance();
+
+    static int stuckCounter[NUMBER_OF_TANK] = { 0 };
+    static float lastX[NUMBER_OF_TANK] = { 0 };
+    static float lastY[NUMBER_OF_TANK] = { 0 };
+    static std::set<int> visitedPatrolPoints[NUMBER_OF_TANK];
+    static PatrolPoint currentTarget[NUMBER_OF_TANK] = { {11, 11}, {11, 11}, {11, 11}, {11, 11} };
+    static int idleFrames[NUMBER_OF_TANK] = { 0 };
+    static LastSeenInfo lastSeen[NUMBER_OF_TANK] = { {0, 0, 0, false}, {0, 0, 0, false}, {0, 0, 0, false}, {0, 0, 0, false} };
+    
+    // MỚI: Đếm số frame liên tục bắn
+    static int continuousShootFrames[NUMBER_OF_TANK] = { 0 };
+
+    std::vector<Strike*> strikes = p_AI->GetIncomingStrike();
+
+    for (int i = 0; i < NUMBER_OF_TANK; i++) {
+        Tank* myTank = p_AI->GetMyTank(i);
+
+        if (!myTank || myTank->GetHP() <= 0 || myTank->IsDisabled()) {
+            continue;
+        }
+
+        // PHÁT HIỆN ĐẠN NGUY HIỂM
+        std::vector<DangerBullet> dangerBullets = DetectDangerousBullets(p_AI, myTank);
+
+        // Kiểm tra strike nguy hiểm
+        bool strikeNear = false;
+        int strikeEscapeDir = DIRECTION_UP;
+
+        for (auto strike : strikes) {
+            if (!strike->IsAlive() || strike->GetCountDown() > 20) continue;
+
+            float dist = Distance(myTank->GetX(), myTank->GetY(),
+                strike->GetX(), strike->GetY());
+
+            if (dist < 4.5f) {
+                strikeNear = true;
+                strikeEscapeDir = GetDirectionToTarget(strike->GetX(), strike->GetY(),
+                    myTank->GetX(), myTank->GetY());
+                break;
+            }
+        }
+
+        // Kiểm tra kẹt
+        float moveDistance = Distance(myTank->GetX(), myTank->GetY(), lastX[i], lastY[i]);
+        if (moveDistance < 0.08f) {
+            stuckCounter[i]++;
+        }
+        else {
+            stuckCounter[i] = 0;
+        }
+
+        lastX[i] = myTank->GetX();
+        lastY[i] = myTank->GetY();
+
+        // TÌM ĐỊCH THÔNG MINH
+        Tank* target = FindBestEnemyTarget(p_AI, myTank);
+
+        // Cập nhật vị trí thấy địch lần cuối
+        if (target) {
+            lastSeen[i].x = target->GetX();
+            lastSeen[i].y = target->GetY();
+            lastSeen[i].framesSince = 0;
+            lastSeen[i].valid = true;
+        }
+        else if (lastSeen[i].valid) {
+            lastSeen[i].framesSince++;
+            if (lastSeen[i].framesSince > 100) {
+                lastSeen[i].valid = false;
+            }
+        }
+
+        bool cooldownReady = (myTank->GetCoolDown() == 0);
+
+        // ========== LOGIC MỚI: VỪA NÉ VỪA BẮN LIÊN TỤC ==========
+        if (!dangerBullets.empty() || strikeNear) {
+            int dodgeDir;
+            bool shouldMove = true;
+            bool shouldShoot = false;
+
+            if (!dangerBullets.empty()) {
+                DangerBullet& danger = dangerBullets[0];
+                
+                // ĐÁNH GIÁ CÁC LỰA CHỌN NÉ
+                std::vector<DodgeOption> dodgeOptions = EvaluateDodgeOptions(p_AI, myTank, target, danger.escapeDir);
+                
+                if (!dodgeOptions.empty()) {
+                    // Chọn hướng né TỐT NHẤT (vừa an toàn vừa có thể bắn)
+                    DodgeOption bestOption = dodgeOptions[0];
+                    dodgeDir = bestOption.direction;
+                    
+                    // QUYẾT ĐỊNH BẮN DỰA TRÊN TÌNH HUỐNG
+                    if (target && cooldownReady) {
+                        // CÓ ĐỊCH VÀ COOLDOWN SẴN SÀNG - ƯU TIÊN BẮN!
+                        
+                        if (bestOption.canShootEnemy) {
+                            // HƯỚNG NÉ VỪA NGẮM ĐỊCH - BẮN LUÔN!
+                            shouldShoot = true;
+                            shouldMove = true; // VỪA NÉ VỪA BẮN
+                            continuousShootFrames[i]++;
+                        }
+                        else if (danger.timeToHit > 15) {
+                            // ĐẠN CÒN RẤT XA - NGẮM VÀ BẮN NGAY
+                            int aimDir = GetDirectionToTarget(myTank->GetX(), myTank->GetY(),
+                                target->GetX(), target->GetY());
+                            
+                            dodgeDir = aimDir; // Quay hướng bắn
+                            shouldMove = false; // Đứng yên ngắm
+                            
+                            // Kiểm tra đã ngắm đúng chưa - BẮN NGAY!
+                            if (CanShootEnemy(p_AI, myTank, target, 2.5f)) {
+                                shouldShoot = true;
+                                continuousShootFrames[i]++;
+                            }
+                        }
+                        else if (danger.timeToHit > 8) {
+                            // ĐẠN GẦN VỪA - ƯU TIÊN BẮN
+                            // Kiểm tra hướng hiện tại có bắn được không
+                            if (CanShootEnemy(p_AI, myTank, target, 2.5f)) {
+                                shouldShoot = true; // BẮN!
+                                shouldMove = false; // ĐỨNG YÊN BẮN CHO CHUẨN
+                                continuousShootFrames[i]++;
+                            }
+                            else {
+                                // Chưa ngắm đúng - quay nhanh
+                                int quickAim = GetDirectionToTarget(myTank->GetX(), myTank->GetY(),
+                                    target->GetX(), target->GetY());
+                                dodgeDir = quickAim;
+                                shouldMove = false;
+                                shouldShoot = false;
+                            }
+                        }
+                        else if (danger.timeToHit > 4) {
+                            // ĐẠN GẦN - VỪA NÉ VỪA BẮN
+                            if (CanShootEnemy(p_AI, myTank, target, 2.5f)) {
+                                shouldShoot = true;
+                                shouldMove = true; // VỪA BẮN VỪA NÉ
+                                continuousShootFrames[i]++;
+                            }
+                            else {
+                                shouldMove = true;
+                                shouldShoot = false;
+                            }
+                        }
+                        else {
+                            // ĐẠN RẤT GẦN - NÉ NHƯNG VẪN CỐ BẮN NẾU CÓ THỂ
+                            shouldMove = true;
+                            if (CanShootEnemy(p_AI, myTank, target, 3.0f)) { // Tăng tolerance khi khẩn cấp
+                                shouldShoot = true;
+                                continuousShootFrames[i]++;
+                            }
+                        }
+                    }
+                    else if (target && !cooldownReady) {
+                        // CÓ ĐỊCH NHƯNG ĐANG COOLDOWN - GIỮ NGẮM
+                        if (bestOption.canShootEnemy || CanShootEnemy(p_AI, myTank, target, 2.5f)) {
+                            // Đã ngắm đúng - giữ hướng, di chuyển nhẹ
+                            shouldMove = (danger.timeToHit < 10);
+                        }
+                        else {
+                            shouldMove = true;
+                        }
+                        shouldShoot = false;
+                    }
+                    else {
+                        // KHÔNG CÓ ĐỊCH - NÉ THUẦN TÚY
+                        shouldMove = true;
+                        shouldShoot = false;
+                        continuousShootFrames[i] = 0;
+                    }
+                }
+                else {
+                    // Không có hướng nào né được - thử ngẫu nhiên
+                    dodgeDir = danger.escapeDir;
+                    shouldMove = true;
+                    shouldShoot = false;
+                }
+            }
+            else {
+                // STRIKE GẦN - NÉ NHANH NHƯNG VẪN CỐ BẮN
+                std::vector<DodgeOption> dodgeOptions = EvaluateDodgeOptions(p_AI, myTank, target, strikeEscapeDir);
+                
+                if (!dodgeOptions.empty()) {
+                    DodgeOption bestOption = dodgeOptions[0];
+                    dodgeDir = bestOption.direction;
+                    
+                    // Nếu có thể bắn trong khi né strike - BẮN LUÔN!
+                    if (target && cooldownReady && (bestOption.canShootEnemy || CanShootEnemy(p_AI, myTank, target, 3.0f))) {
+                        shouldShoot = true;
+                        continuousShootFrames[i]++;
+                    }
+                }
+                else {
+                    dodgeDir = strikeEscapeDir;
+                    
+                    // Vẫn cố bắn nếu có thể
+                    if (target && cooldownReady && CanShootEnemy(p_AI, myTank, target, 3.0f)) {
+                        shouldShoot = true;
+                    }
+                }
+                
+                shouldMove = true;
+            }
+
+            // THỰC HIỆN LỆNH
+            Game::CommandTank(i, dodgeDir, shouldMove, shouldShoot);
+            continue;
+        }
+
+        // Reset continuous shoot nếu không còn né đạn
+        if (dangerBullets.empty() && !strikeNear) {
+            continuousShootFrames[i] = 0;
+        }
+
+        // ƯU TIÊN 2: XỬ LÝ KẸT
+        if (stuckCounter[i] > 2 || HasWaterOrWallAhead(p_AI, myTank)) {
+            if (target) {
+                int newDir = FindBestDirection(p_AI, myTank, target->GetX(), target->GetY());
+
+                bool shouldShoot = false;
+                if (HasSoftObstacleAhead(p_AI, myTank) && !HasHardObstacleAhead(p_AI, myTank) && cooldownReady) {
+                    shouldShoot = true;
+                }
+                // MỚI: Cố bắn địch ngay cả khi đang xử lý kẹt
+                else if (cooldownReady && CanShootEnemy(p_AI, myTank, target)) {
+                    shouldShoot = true;
+                }
+
+                Game::CommandTank(i, newDir, true, shouldShoot);
+            }
+            else if (lastSeen[i].valid) {
+                int newDir = FindBestDirection(p_AI, myTank, lastSeen[i].x, lastSeen[i].y);
+                
+                bool shouldShoot = (HasSoftObstacleAhead(p_AI, myTank) && 
+                                   !HasHardObstacleAhead(p_AI, myTank) && cooldownReady);
+                
+                Game::CommandTank(i, newDir, true, shouldShoot);
+            }
+            else {
+                int patrolDir = FindBestDirection(p_AI, myTank,
+                    currentTarget[i].x, currentTarget[i].y);
+                    
+                bool shouldShoot = (HasSoftObstacleAhead(p_AI, myTank) && 
+                                   !HasHardObstacleAhead(p_AI, myTank) && cooldownReady);
+                                   
+                Game::CommandTank(i, patrolDir, true, shouldShoot);
+            }
+
+            if (stuckCounter[i] > 10) stuckCounter[i] = 0;
+            continue;
+        }
+
+        // ƯU TIÊN 3: CHIẾN ĐẤU TÍCH CỰC - BẮN LIÊN TỤC, KHÔNG BAO GIỜ BỎ LỠ
+        if (target) {
+            idleFrames[i] = 0;
+
+            float distToEnemy = Distance(myTank->GetX(), myTank->GetY(),
+                target->GetX(), target->GetY());
+
+            // Kiểm tra với tolerance RỘNG để dễ bắn
+            bool canShootNow = CanShootEnemy(p_AI, myTank, target, 2.5f);
+            bool hasWall = HasHardObstacleBetween(p_AI,
+                myTank->GetX(), myTank->GetY(), target->GetX(), target->GetY());
+
+            // =========== LOGIC MỚI: BẮN LIÊN TỤC, KHÔNG CHỜ ĐỢI ===========
+            
+            if (cooldownReady) {
+                // CÓ COOLDOWN - QUYẾT TÂM BẮN!
+                
+                if (canShootNow) {
+                    // ĐÃ NGẮM ĐÚNG - BẮN NGAY LẬP TỨC!
+                    Game::CommandTank(i, myTank->GetDirection(), false, true);
+                }
+                else {
+                    // CHƯA NGẮM ĐÚNG - NGẮM NHANH NHẤT CÓ THỂ
+                    int aimDir = GetDirectionToTarget(myTank->GetX(), myTank->GetY(),
+                        target->GetX(), target->GetY());
+                    
+                    if (distToEnemy < 15.0f && !hasWall) {
+                        // TRONG TẦM - ƯU TIÊN NGẮM, KHÔNG DI CHUYỂN
+                        Game::CommandTank(i, aimDir, false, false);
+                    }
+                    else {
+                        // XA HOẶC CÓ TƯỜNG - TIẾN NHANH
+                        int moveDir = FindBestDirection(p_AI, myTank, target->GetX(), target->GetY());
+                        
+                        bool shootWall = (HasSoftObstacleAhead(p_AI, myTank) && 
+                                         !HasHardObstacleAhead(p_AI, myTank));
+                        
+                        Game::CommandTank(i, moveDir, true, shootWall);
+                    }
+                }
+            }
+            else {
+                // ĐANG COOLDOWN - NHƯNG VẪN CỐ NGẮM
+                
+                if (canShootNow) {
+                    // ĐÃ NGẮM ĐÚNG - DI CHUYỂN CHIẾN THUẬT ĐỂ TỐI ƯU HÓA
+                    int currentDir = myTank->GetDirection();
+                    
+                    if (distToEnemy > 6.0f) {
+                        // XA - TIẾN GẦN VỪA GIỮ NGẮM
+                        Game::CommandTank(i, currentDir, true, false);
+                    }
+                    else if (distToEnemy < 2.0f) {
+                        // QUÁ GẦN - LÙI LẠI
+                        int retreatDir;
+                        switch (currentDir) {
+                        case DIRECTION_UP: retreatDir = DIRECTION_DOWN; break;
+                        case DIRECTION_DOWN: retreatDir = DIRECTION_UP; break;
+                        case DIRECTION_LEFT: retreatDir = DIRECTION_RIGHT; break;
+                        case DIRECTION_RIGHT: retreatDir = DIRECTION_LEFT; break;
+                        default: retreatDir = currentDir;
+                        }
+                        
+                        if (CanMoveInDirection(p_AI, myTank, retreatDir)) {
+                            Game::CommandTank(i, retreatDir, true, false);
+                        }
+                        else {
+                            // Không lùi được - giữ nguyên
+                            Game::CommandTank(i, currentDir, false, false);
+                        }
+                    }
+                    else {
+                        // KHOẢNG CÁCH TỐT (2-6 ô) - ĐỨNG YÊN CHỜ COOLDOWN
+                        // Hoặc di chuyển ngang một chút để né đạn địch
+                        int strafeDir;
+                        switch (currentDir) {
+                        case DIRECTION_UP:
+                        case DIRECTION_DOWN:
+                            strafeDir = (rand() % 2) ? DIRECTION_LEFT : DIRECTION_RIGHT;
+                            break;
+                        case DIRECTION_LEFT:
+                        case DIRECTION_RIGHT:
+                            strafeDir = (rand() % 2) ? DIRECTION_UP : DIRECTION_DOWN;
+                            break;
+                        default:
+                            strafeDir = currentDir;
+                        }
+                        
+                        // 70% đứng yên chờ bắn, 30% di chuyển ngang
+                        if (rand() % 100 < 70) {
+                            Game::CommandTank(i, currentDir, false, false);
+                        }
+                        else if (CanMoveInDirection(p_AI, myTank, strafeDir)) {
+                            Game::CommandTank(i, strafeDir, true, false);
+                        }
+                        else {
+                            Game::CommandTank(i, currentDir, false, false);
+                        }
+                    }
+                }
+                else {
+                    // CHƯA NGẮM ĐÚNG VÀ ĐANG COOLDOWN - NGẮM NGAY
+                    int aimDir = GetDirectionToTarget(myTank->GetX(), myTank->GetY(),
+                        target->GetX(), target->GetY());
+                    
+                    if (distToEnemy < 1.5f) {
+                        // QUÁ GẦN - LÙI VỪA NGẮM
+                        int retreatDir;
+                        switch (aimDir) {
+                        case DIRECTION_UP: retreatDir = DIRECTION_DOWN; break;
+                        case DIRECTION_DOWN: retreatDir = DIRECTION_UP; break;
+                        case DIRECTION_LEFT: retreatDir = DIRECTION_RIGHT; break;
+                        case DIRECTION_RIGHT: retreatDir = DIRECTION_LEFT; break;
+                        default: retreatDir = aimDir;
+                        }
+                        
+                        if (CanMoveInDirection(p_AI, myTank, retreatDir)) {
+                            Game::CommandTank(i, retreatDir, true, false);
+                        }
+                        else {
+                            Game::CommandTank(i, aimDir, false, false);
+                        }
+                    }
+                    else if (distToEnemy < 10.0f && !hasWall) {
+                        // KHOẢNG CÁCH VỪA - ĐỨNG YÊN NGẮM
+                        Game::CommandTank(i, aimDir, false, false);
+                    }
+                    else {
+                        // XA - TIẾN NHANH
+                        int moveDir = FindBestDirection(p_AI, myTank, target->GetX(), target->GetY());
+                        
+                        bool shootWall = (HasSoftObstacleAhead(p_AI, myTank) && 
+                                         !HasHardObstacleAhead(p_AI, myTank));
+                        
+                        Game::CommandTank(i, moveDir, true, shootWall);
+                    }
+                }
+            }
+        }
+        // ƯU TIÊN 4: ĐI TÌM VỊ TRÍ THẤY ĐỊCH LẦN CUỐI
+        else if (lastSeen[i].valid && lastSeen[i].framesSince < 50) {
+            float distToLastSeen = Distance(myTank->GetX(), myTank->GetY(),
+                lastSeen[i].x, lastSeen[i].y);
+
+            if (distToLastSeen > 1.5f) {
+                int searchDir = FindBestDirection(p_AI, myTank, lastSeen[i].x, lastSeen[i].y);
+
+                bool shouldShoot = HasSoftObstacleAhead(p_AI, myTank) &&
+                    !HasHardObstacleAhead(p_AI, myTank) && cooldownReady;
+
+                Game::CommandTank(i, searchDir, true, shouldShoot);
+            }
+            else {
+                lastSeen[i].valid = false;
+                currentTarget[i] = FindNextPatrolPoint(p_AI, myTank, visitedPatrolPoints[i]);
+            }
+        }
+        // ƯU TIÊN 5: TUẦN TRA TÌM KIẾM
+        else {
+            idleFrames[i]++;
+
+            float distToPatrol = Distance(myTank->GetX(), myTank->GetY(),
+                currentTarget[i].x, currentTarget[i].y);
+
+            if (distToPatrol < 2.0f || idleFrames[i] > 40) {
+                currentTarget[i] = FindNextPatrolPoint(p_AI, myTank, visitedPatrolPoints[i]);
+                idleFrames[i] = 0;
+            }
+
+            int patrolDir = FindBestDirection(p_AI, myTank,
+                currentTarget[i].x, currentTarget[i].y);
+
+            bool shouldShoot = HasSoftObstacleAhead(p_AI, myTank) &&
+                !HasHardObstacleAhead(p_AI, myTank) && cooldownReady;
+
+            Game::CommandTank(i, patrolDir, true, shouldShoot);
+        }
+    }
+
+    // SỬ DỤNG POWER-UP
+    if (p_AI->HasAirstrike()) {
+        float bestX = 0, bestY = 0;
+        int maxTanks = 0;
+
+        for (int i = 0; i < NUMBER_OF_TANK; i++) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+
+            int nearbyCount = 0;
+            for (int j = 0; j < NUMBER_OF_TANK; j++) {
+                Tank* other = p_AI->GetEnemyTank(j);
+                if (!other || other->GetHP() <= 0 || i == j) continue;
+
+                float dist = Distance(enemy->GetX(), enemy->GetY(),
+                    other->GetX(), other->GetY());
+                if (dist < 3.5f) nearbyCount++;
+            }
+
+            if (nearbyCount > maxTanks) {
+                maxTanks = nearbyCount;
+                bestX = enemy->GetX();
+                bestY = enemy->GetY();
+            }
+        }
+
+        if (maxTanks > 0 || bestX != 0) {
+            p_AI->UseAirstrike(bestX, bestY);
+        }
+    }
+    else if (p_AI->HasEMP()) {
+        Tank* strongest = NULL;
+        int maxHP = 0;
+
+        for (int i = 0; i < NUMBER_OF_TANK; i++) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+
+            if (enemy->GetHP() > maxHP) {
+                maxHP = enemy->GetHP();
+                strongest = enemy;
+            }
+        }
+
+        if (strongest) {
+            p_AI->UseEMP(strongest->GetX(), strongest->GetY());
+        }
+    }
+
+    Game::GetInstance()->SendCommand();
+}
+
+int main(int argc, char* argv[]) {
+    srand(time(NULL));
+
+#ifdef _WIN32
+    INT rc;
+    WSADATA wsaData;
+    rc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (rc) {
+        printf("WSAStartup Failed.\n");
+        return 1;
+    }
+#endif
+
+    Game::CreateInstance();
+    Game* p_Game = Game::GetInstance();
+
+    if (p_Game->Connect(argc, argv) == -1) {
+        LOG("Failed to connect to server!\n");
+        return -1;
+    }
+
+    AI::GetInstance()->PlaceTank = &AI_Placement;
+    AI::GetInstance()->Update = &AI_Update;
+
+    p_Game->PollingFromServer();
+
+    Game::DestroyInstance();
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
+}
