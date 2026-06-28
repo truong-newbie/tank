@@ -1,0 +1,1097 @@
+#include <ai/Game.h>
+#include <ai/AI.h>
+#include <time.h>
+#include <cmath>
+#include <algorithm>
+#include <queue>
+#include <vector>
+#include <cstdlib>
+#include <cstdio>
+
+static const float INF = 1000000000.0f;
+static int g_tick = 0;
+
+struct Cell { int x, y; };
+struct PathNode { int x, y, firstDir, steps; };
+struct PathInfo { bool found; int firstDir; int steps; };
+
+struct HuntPlan {
+    bool  valid;
+    int   enemyId;
+    int   moveDir;
+    int   shootDir;
+    bool  canShootNow;
+    int   goalX, goalY;
+    float score;
+};
+
+struct BulletThreat {
+    float bulletX, bulletY, bulletSpeed;
+    int   bulletDir;
+    float timeToHit;
+};
+
+// ============================================================
+// BASE DEFENSE STATE — toàn cục
+// ============================================================
+static bool  g_baseUnderAttack = false;   // địch đang tấn công base
+static int   g_baseAttackerEnemyId = -1;      // enemy đang tấn công
+static int   g_baseDefenseTick = 0;       // tick phát hiện
+
+// ============================================================
+// MATH HELPERS
+// ============================================================
+static float AbsF(float v) { return v < 0.0f ? -v : v; }
+
+float Distance(float x1, float y1, float x2, float y2) {
+    float dx = x1 - x2, dy = y1 - y2;
+    return sqrtf(dx * dx + dy * dy);
+}
+static float DistSq(float x1, float y1, float x2, float y2) {
+    float dx = x1 - x2, dy = y1 - y2;
+    return dx * dx + dy * dy;
+}
+static int ClampInt(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+static int ToCell(float v) {
+    return ClampInt((int)(v + 0.5f), 1, MAP_W - 2);
+}
+static bool InBoard(int x, int y) {
+    return x > 0 && x < MAP_W - 1 && y > 0 && y < MAP_H - 1;
+}
+static void DirectionDelta(int dir, int& dx, int& dy) {
+    dx = dy = 0;
+    if (dir == DIRECTION_UP)    dy = -1;
+    else if (dir == DIRECTION_RIGHT) dx = 1;
+    else if (dir == DIRECTION_DOWN)  dy = 1;
+    else if (dir == DIRECTION_LEFT)  dx = -1;
+}
+
+// ============================================================
+// BLOCK / OCCUPATION HELPERS
+// ============================================================
+static bool IsBlockingShotBlock(int block) {
+    return block == BLOCK_HARD_OBSTACLE ||
+        block == BLOCK_SOFT_OBSTACLE ||
+        block == BLOCK_BASE ||
+        block == BLOCK_OUT_OF_BOARD;
+}
+static bool OccupiesCell(Tank* tank, int x, int y) {
+    if (!tank) return false;
+    return AbsF(tank->GetX() - (float)x) <= 0.55f &&
+        AbsF(tank->GetY() - (float)y) <= 0.55f;
+}
+static bool TankBodyAt(AI* ai, int myId, int x, int y) {
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* mine = ai->GetMyTank(i);
+        if (i != myId && OccupiesCell(mine, x, y)) return true;
+        Tank* enemy = ai->GetEnemyTank(i);
+        if (OccupiesCell(enemy, x, y)) return true;
+    }
+    return false;
+}
+static bool TankBodyOnRay(AI* ai, int myId, Tank* target, float x, float y) {
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* mine = ai->GetMyTank(i);
+        if (i != myId && mine &&
+            AbsF(mine->GetX() - x) <= 0.50f && AbsF(mine->GetY() - y) <= 0.50f)
+            return true;
+        Tank* enemy = ai->GetEnemyTank(i);
+        if (enemy && enemy != target &&
+            AbsF(enemy->GetX() - x) <= 0.50f && AbsF(enemy->GetY() - y) <= 0.50f)
+            return true;
+    }
+    return false;
+}
+static bool CanStand(AI* ai, int myId, int x, int y) {
+    if (!InBoard(x, y)) return false;
+    if (ai->GetBlock(x, y) != BLOCK_GROUND) return false;
+    return !TankBodyAt(ai, myId, x, y);
+}
+static bool IsCurrentCell(Tank* tank, int x, int y) {
+    return ToCell(tank->GetX()) == x && ToCell(tank->GetY()) == y;
+}
+static bool CanUseGoalCell(AI* ai, int myId, Tank* mine, int x, int y) {
+    return IsCurrentCell(mine, x, y) || CanStand(ai, myId, x, y);
+}
+static bool Reserved(bool res[MAP_H][MAP_W], int x, int y) {
+    if (!InBoard(x, y)) return true;
+    return res[y][x];
+}
+static void ReserveCommand(Tank* tank, int dir, bool move, bool res[MAP_H][MAP_W]) {
+    int x = ToCell(tank->GetX()), y = ToCell(tank->GetY());
+    if (move) {
+        int dx, dy; DirectionDelta(dir, dx, dy);
+        x = ClampInt(x + dx, 1, MAP_W - 2);
+        y = ClampInt(y + dy, 1, MAP_H - 2);
+    }
+    res[y][x] = true;
+}
+static void CommandTankReserved(int tankId, Tank* tank, int dir, bool move, bool shoot,
+    bool res[MAP_H][MAP_W]) {
+    if (dir < DIRECTION_UP || dir > DIRECTION_LEFT) dir = tank->GetDirection();
+    ReserveCommand(tank, dir, move, res);
+    Game::CommandTank(tankId, dir, move, shoot);
+}
+
+// ============================================================
+// RAY / SHOT HELPERS
+// ============================================================
+static bool PointInsideTarget(Tank* target, float x, float y) {
+    return target && target->GetHP() > 0 &&
+        AbsF(target->GetX() - x) <= 0.50f &&
+        AbsF(target->GetY() - y) <= 0.50f;
+}
+static bool RayClearToTarget(AI* ai, int myId, float sx, float sy, Tank* target, int dir) {
+    int dx, dy; DirectionDelta(dir, dx, dy);
+    if (dx == 0 && dy == 0) return false;
+    float x = sx, y = sy;
+    for (int step = 0; step < 120; ++step) {
+        x += dx * 0.25f; y += dy * 0.25f;
+        if (x < 0 || x > MAP_W - 1 || y < 0 || y > MAP_H - 1) return false;
+        if (PointInsideTarget(target, x, y)) return true;
+        if (TankBodyOnRay(ai, myId, target, x, y)) return false;
+        int cx = ClampInt((int)(x + 0.5f), 0, MAP_W - 1);
+        int cy = ClampInt((int)(y + 0.5f), 0, MAP_H - 1);
+        if (IsBlockingShotBlock(ai->GetBlock(cx, cy))) return false;
+    }
+    return false;
+}
+static int ClearShotDirection(AI* ai, int myId, float sx, float sy, Tank* target) {
+    if (!target || target->GetHP() <= 0) return 0;
+    if (AbsF(sy - target->GetY()) <= 0.55f) {
+        if (target->GetX() > sx + 0.20f &&
+            RayClearToTarget(ai, myId, sx, sy, target, DIRECTION_RIGHT)) return DIRECTION_RIGHT;
+        if (target->GetX() < sx - 0.20f &&
+            RayClearToTarget(ai, myId, sx, sy, target, DIRECTION_LEFT))  return DIRECTION_LEFT;
+    }
+    if (AbsF(sx - target->GetX()) <= 0.55f) {
+        if (target->GetY() > sy + 0.20f &&
+            RayClearToTarget(ai, myId, sx, sy, target, DIRECTION_DOWN))  return DIRECTION_DOWN;
+        if (target->GetY() < sy - 0.20f &&
+            RayClearToTarget(ai, myId, sx, sy, target, DIRECTION_UP))    return DIRECTION_UP;
+    }
+    return 0;
+}
+static bool StopsFireScan(AI* ai, int myId, Tank* target, int x, int y) {
+    if (IsBlockingShotBlock(ai->GetBlock(x, y))) return true;
+    return TankBodyAt(ai, myId, x, y);
+}
+
+// Đếm tường mềm cần phá trên cùng hàng/cột
+static int SoftWallShotsNeeded(AI* ai, int myId, int fromX, int fromY, int toX, int toY) {
+    if (fromX != toX && fromY != toY) return -1;
+    int dx = (toX > fromX) ? 1 : (toX < fromX) ? -1 : 0;
+    int dy = (toY > fromY) ? 1 : (toY < fromY) ? -1 : 0;
+    int softCount = 0;
+    int cx = fromX + dx, cy = fromY + dy;
+    while (cx != toX || cy != toY) {
+        if (TankBodyAt(ai, myId, cx, cy)) return -1;
+        int block = ai->GetBlock(cx, cy);
+        if (block == BLOCK_HARD_OBSTACLE || block == BLOCK_BASE ||
+            block == BLOCK_OUT_OF_BOARD) return -1;
+        if (block == BLOCK_SOFT_OBSTACLE) ++softCount;
+        cx += dx; cy += dy;
+    }
+    return softCount;
+}
+
+// ============================================================
+// BASE LOCATION HELPER
+// Tìm vị trí base của team mình và team địch từ map
+// ============================================================
+static bool FindBasePosition(AI* ai, bool myBase, int& bx, int& by) {
+    // Quét toàn bộ map tìm BLOCK_BASE
+    // Base của mình nằm ở nửa bản đồ tương ứng với team
+    int myTeam = ai->GetMyTeam();
+
+    // Xác định vùng tìm: TEAM_1 thường ở nửa trái, TEAM_2 ở nửa phải
+    // Nhưng vì không có API trực tiếp, ta quét map và chọn base
+    // gần góc của team mình
+    float refX, refY;
+    if (myBase) {
+        // Base mình: tham chiếu góc deploy của mình
+        refX = (myTeam == TEAM_1) ? 0.0f : (float)(MAP_W - 1);
+        refY = (myTeam == TEAM_1) ? 0.0f : (float)(MAP_H - 1);
+    }
+    else {
+        // Base địch: ngược lại
+        refX = (myTeam == TEAM_1) ? (float)(MAP_W - 1) : 0.0f;
+        refY = (myTeam == TEAM_1) ? (float)(MAP_H - 1) : 0.0f;
+    }
+
+    float bestDist = INF;
+    bool  found = false;
+    for (int y = 1; y < MAP_H - 1; ++y) {
+        for (int x = 1; x < MAP_W - 1; ++x) {
+            if (ai->GetBlock(x, y) == BLOCK_BASE) {
+                float d = DistSq((float)x, (float)y, refX, refY);
+                if (d < bestDist) { bestDist = d; bx = x; by = y; found = true; }
+            }
+        }
+    }
+    return found;
+}
+
+// ============================================================
+// BASE DEFENSE: Phát hiện địch tấn công base mình
+// Trả về enemyId đang tấn công, -1 nếu an toàn
+// ============================================================
+static int DetectBaseAttacker(AI* ai) {
+    int baseBx = -1, baseBy = -1;
+    if (!FindBasePosition(ai, true, baseBx, baseBy)) return -1;
+
+    // Ngưỡng nguy hiểm: địch trong bán kính 4 ô quanh base
+    const float BASE_DANGER_RADIUS = 4.0f;
+
+    int   closestEnemy = -1;
+    float closestDist = INF;
+
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* enemy = ai->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+
+        float d = Distance(enemy->GetX(), enemy->GetY(), (float)baseBx, (float)baseBy);
+        if (d < BASE_DANGER_RADIUS && d < closestDist) {
+            closestDist = d;
+            closestEnemy = i;
+        }
+    }
+    return closestEnemy;
+}
+
+// Cập nhật trạng thái phòng thủ base mỗi tick
+static void UpdateBaseDefenseState(AI* ai) {
+    int attacker = DetectBaseAttacker(ai);
+
+    if (attacker >= 0) {
+        // Địch đang tấn công → kích hoạt defense mode
+        g_baseUnderAttack = true;
+        g_baseAttackerEnemyId = attacker;
+        g_baseDefenseTick = g_tick;
+    }
+    else {
+        // Không còn mối đe dọa trực tiếp
+        // Giữ defense mode thêm 60 tick sau khi địch rời đi
+        // (tránh tank bỏ trận địa quá sớm)
+        if (g_baseUnderAttack && (g_tick - g_baseDefenseTick) > 60) {
+            g_baseUnderAttack = false;
+            g_baseAttackerEnemyId = -1;
+        }
+    }
+}
+
+// ============================================================
+// PATHFINDING — BFS chuẩn (check reserved)
+// ============================================================
+static PathInfo FindPath(AI* ai, int myId, Tank* mine, int goalX, int goalY,
+    bool res[MAP_H][MAP_W]) {
+    PathInfo result = { false, 0, 999999 };
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    if (!CanUseGoalCell(ai, myId, mine, goalX, goalY)) return result;
+    if (sx == goalX && sy == goalY) { result.found = true; result.steps = 0; return result; }
+
+    bool visited[MAP_W][MAP_H] = {};
+    std::queue<PathNode> q;
+    q.push({ sx, sy, 0, 0 });
+    visited[sx][sy] = true;
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    while (!q.empty()) {
+        PathNode cur = q.front(); q.pop();
+        for (int i = 0; i < 4; ++i) {
+            int dx, dy; DirectionDelta(dirs[i], dx, dy);
+            int nx = cur.x + dx, ny = cur.y + dy;
+            if (!InBoard(nx, ny) || visited[nx][ny]) continue;
+            if (!CanStand(ai, myId, nx, ny)) continue;
+            if (Reserved(res, nx, ny)) continue;
+            int first = cur.steps == 0 ? dirs[i] : cur.firstDir;
+            int steps = cur.steps + 1;
+            if (nx == goalX && ny == goalY) {
+                result.found = true; result.firstDir = first; result.steps = steps;
+                return result;
+            }
+            visited[nx][ny] = true;
+            q.push({ nx, ny, first, steps });
+        }
+    }
+    return result;
+}
+
+// BFS bỏ qua reserved — fallback khi stuck hoặc cần tìm đường bất chấp teammate
+static PathInfo FindPathIgnoreReserved(AI* ai, int myId, Tank* mine, int goalX, int goalY) {
+    PathInfo result = { false, 0, 999999 };
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    if (!InBoard(goalX, goalY)) return result;
+    if (sx == goalX && sy == goalY) { result.found = true; result.steps = 0; return result; }
+
+    bool visited[MAP_W][MAP_H] = {};
+    std::queue<PathNode> q;
+    q.push({ sx, sy, 0, 0 });
+    visited[sx][sy] = true;
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    while (!q.empty()) {
+        PathNode cur = q.front(); q.pop();
+        for (int i = 0; i < 4; ++i) {
+            int dx, dy; DirectionDelta(dirs[i], dx, dy);
+            int nx = cur.x + dx, ny = cur.y + dy;
+            if (!InBoard(nx, ny) || visited[nx][ny]) continue;
+            if (!CanStand(ai, myId, nx, ny)) continue;
+            // KHÔNG check reserved
+            int first = cur.steps == 0 ? dirs[i] : cur.firstDir;
+            int steps = cur.steps + 1;
+            if (nx == goalX && ny == goalY) {
+                result.found = true; result.firstDir = first; result.steps = steps;
+                return result;
+            }
+            visited[nx][ny] = true;
+            q.push({ nx, ny, first, steps });
+        }
+    }
+    return result;
+}
+
+static int BestImmediateStep(AI* ai, int myId, Tank* mine, int goalX, int goalY,
+    bool res[MAP_H][MAP_W]) {
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    int bestDir = 0; float bestScore = INF;
+    for (int i = 0; i < 4; ++i) {
+        int idx = (i + myId + g_tick) % 4;
+        int dx, dy; DirectionDelta(dirs[idx], dx, dy);
+        int nx = sx + dx, ny = sy + dy;
+        if (!CanStand(ai, myId, nx, ny)) continue;
+        if (Reserved(res, nx, ny)) continue;
+        float score = DistSq((float)nx, (float)ny, (float)goalX, (float)goalY);
+        if (score < bestScore) { bestScore = score; bestDir = dirs[idx]; }
+    }
+    return bestDir;
+}
+
+static int BestImmediateStepIgnoreReserved(AI* ai, int myId, Tank* mine, int goalX, int goalY) {
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    int bestDir = 0; float bestScore = INF;
+    for (int i = 0; i < 4; ++i) {
+        int idx = (i + myId + g_tick) % 4;
+        int dx, dy; DirectionDelta(dirs[idx], dx, dy);
+        int nx = sx + dx, ny = sy + dy;
+        if (!CanStand(ai, myId, nx, ny)) continue;
+        float score = DistSq((float)nx, (float)ny, (float)goalX, (float)goalY);
+        if (score < bestScore) { bestScore = score; bestDir = dirs[idx]; }
+    }
+    return bestDir;
+}
+
+static bool CanMoveDirection(AI* ai, int myId, Tank* mine, int dir,
+    bool res[MAP_H][MAP_W], int& nx, int& ny) {
+    int dx, dy; DirectionDelta(dir, dx, dy);
+    nx = ToCell(mine->GetX()) + dx;
+    ny = ToCell(mine->GetY()) + dy;
+    return CanStand(ai, myId, nx, ny) && !Reserved(res, nx, ny);
+}
+
+// Tìm hướng di chuyển tốt nhất với nhiều tầng fallback
+static int ResolveMove(AI* ai, int myId, Tank* mine, int desiredDir,
+    int goalX, int goalY, bool res[MAP_H][MAP_W], bool stuck) {
+    int nx, ny;
+    if (desiredDir != 0 && CanMoveDirection(ai, myId, mine, desiredDir, res, nx, ny))
+        return desiredDir;
+
+    PathInfo fresh = FindPath(ai, myId, mine, goalX, goalY, res);
+    if (fresh.found && fresh.firstDir != 0 &&
+        CanMoveDirection(ai, myId, mine, fresh.firstDir, res, nx, ny))
+        return fresh.firstDir;
+
+    int detour = BestImmediateStep(ai, myId, mine, goalX, goalY, res);
+    if (detour != 0) return detour;
+
+    if (stuck) {
+        detour = BestImmediateStepIgnoreReserved(ai, myId, mine, goalX, goalY);
+        if (detour != 0) return detour;
+        PathInfo ig = FindPathIgnoreReserved(ai, myId, mine, goalX, goalY);
+        if (ig.found && ig.firstDir != 0) return ig.firstDir;
+    }
+    return 0;
+}
+
+// ============================================================
+// FindBestFireGoalSafe
+// FIX: thêm fallback ignore-reserved khi tất cả ô bắn bị block
+// ============================================================
+static bool FindBestFireGoalSafe(AI* ai, int myId, Tank* mine, Tank* target,
+    bool res[MAP_H][MAP_W], HuntPlan& plan) {
+    bool found = false; float bestScore = INF;
+    int tx = ToCell(target->GetX()), ty = ToCell(target->GetY());
+
+    // Lần 1: check reserved bình thường
+    auto tryCell = [&](int cx, int cy, bool ignoreRes) {
+        if (!CanUseGoalCell(ai, myId, mine, cx, cy)) return;
+        if (!ignoreRes && !IsCurrentCell(mine, cx, cy) && Reserved(res, cx, cy)) return;
+
+        int shootDir = ClearShotDirection(ai, myId, (float)cx, (float)cy, target);
+        if (shootDir == 0) return;
+
+        PathInfo path = ignoreRes
+            ? FindPathIgnoreReserved(ai, myId, mine, cx, cy)
+            : FindPath(ai, myId, mine, cx, cy, res);
+        if (!path.found) return;
+
+        // Penalty nhỏ nếu bỏ qua reserved (có thể va chạm nhẹ teammate)
+        float penalty = ignoreRes ? 2.0f : 0.0f;
+        float score = (float)path.steps + penalty +
+            Distance((float)cx, (float)cy, target->GetX(), target->GetY()) * 0.12f;
+        if (score < bestScore) {
+            bestScore = score; plan.valid = true;
+            plan.moveDir = path.firstDir; plan.shootDir = shootDir;
+            plan.canShootNow = (path.steps == 0);
+            plan.goalX = cx; plan.goalY = cy; plan.score = score; found = true;
+        }
+        };
+
+    // Pass 1: với reserved
+    for (int x = tx - 1; x >= 1; --x) { if (StopsFireScan(ai, myId, target, x, ty)) break; tryCell(x, ty, false); }
+    for (int x = tx + 1; x < MAP_W - 1; ++x) { if (StopsFireScan(ai, myId, target, x, ty)) break; tryCell(x, ty, false); }
+    for (int y = ty - 1; y >= 1; --y) { if (StopsFireScan(ai, myId, target, tx, y)) break; tryCell(tx, y, false); }
+    for (int y = ty + 1; y < MAP_H - 1; ++y) { if (StopsFireScan(ai, myId, target, tx, y)) break; tryCell(tx, y, false); }
+
+    // Pass 2: bỏ qua reserved nếu chưa tìm được (FIX VẤN ĐỀ 3)
+    if (!found) {
+        for (int x = tx - 1; x >= 1; --x) { if (StopsFireScan(ai, myId, target, x, ty)) break; tryCell(x, ty, true); }
+        for (int x = tx + 1; x < MAP_W - 1; ++x) { if (StopsFireScan(ai, myId, target, x, ty)) break; tryCell(x, ty, true); }
+        for (int y = ty - 1; y >= 1; --y) { if (StopsFireScan(ai, myId, target, tx, y)) break; tryCell(tx, y, true); }
+        for (int y = ty + 1; y < MAP_H - 1; ++y) { if (StopsFireScan(ai, myId, target, tx, y)) break; tryCell(tx, y, true); }
+    }
+    return found;
+}
+
+// ============================================================
+// FindBestChaseGoalSafe
+// FIX VẤN ĐỀ 2: "continue" thay vì "break" khi d2 < 4
+// FIX VẤN ĐỀ 3: ignoreReserved param
+// ============================================================
+static bool FindBestChaseGoalSafe(AI* ai, int myId, Tank* mine, Tank* target,
+    bool res[MAP_H][MAP_W], HuntPlan& plan,
+    bool ignoreReserved = false) {
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    float tx = target->GetX(), ty = target->GetY();
+    int maxDepth = ClampInt((int)Distance(mine->GetX(), mine->GetY(), tx, ty) + 6,
+        8, MAP_W + MAP_H);
+
+    bool visited[MAP_W][MAP_H] = {};
+    std::queue<PathNode> q;
+    q.push({ sx, sy, 0, 0 });
+    visited[sx][sy] = true;
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    bool found = false; float bestScore = INF;
+
+    while (!q.empty()) {
+        PathNode cur = q.front(); q.pop();
+
+        if (cur.steps > 0) {
+            float d2 = DistSq((float)cur.x, (float)cur.y, tx, ty);
+            float score = (float)cur.steps + d2 * 0.04f;
+            if (score < bestScore) {
+                bestScore = score; plan.valid = true; plan.moveDir = cur.firstDir;
+                plan.shootDir = 0; plan.canShootNow = false;
+                plan.goalX = cur.x; plan.goalY = cur.y; plan.score = score;
+                found = true;
+            }
+            // FIX VẤN ĐỀ 2: "continue" thay vì "break"!
+            // Không expand tiếp từ node này nhưng vẫn xét node khác trong queue
+            if (d2 < 4.0f) continue;
+        }
+
+        if (cur.steps >= maxDepth) continue;
+
+        for (int i = 0; i < 4; ++i) {
+            int dx, dy; DirectionDelta(dirs[i], dx, dy);
+            int nx = cur.x + dx, ny = cur.y + dy;
+            if (!InBoard(nx, ny) || visited[nx][ny]) continue;
+            if (!CanStand(ai, myId, nx, ny)) continue;
+            if (!ignoreReserved && Reserved(res, nx, ny)) continue;
+            visited[nx][ny] = true;
+            int first = cur.steps == 0 ? dirs[i] : cur.firstDir;
+            q.push({ nx, ny, first, cur.steps + 1 });
+        }
+    }
+    return found;
+}
+
+// FindWallBreakGoal — đứng trên cùng trục, bắn phá tường mềm
+static bool FindWallBreakGoal(AI* ai, int myId, Tank* mine, Tank* target,
+    bool res[MAP_H][MAP_W], HuntPlan& plan) {
+    int tx = ToCell(target->GetX()), ty = ToCell(target->GetY());
+    float bestScore = INF; bool found = false;
+
+    auto tryBreakCell = [&](int cx, int cy) {
+        if (!CanUseGoalCell(ai, myId, mine, cx, cy)) return;
+        if (!IsCurrentCell(mine, cx, cy) && Reserved(res, cx, cy)) return;
+        int softShots = SoftWallShotsNeeded(ai, myId, cx, cy, tx, ty);
+        if (softShots <= 0 || softShots > 2) return;
+        int shootDir = 0;
+        if (cx == tx) shootDir = (ty > cy) ? DIRECTION_DOWN : DIRECTION_UP;
+        else          shootDir = (tx > cx) ? DIRECTION_RIGHT : DIRECTION_LEFT;
+        PathInfo path = FindPath(ai, myId, mine, cx, cy, res);
+        if (!path.found) path = FindPathIgnoreReserved(ai, myId, mine, cx, cy);
+        if (!path.found) return;
+        float score = (float)path.steps + (float)softShots * 3.0f +
+            Distance((float)cx, (float)cy, target->GetX(), target->GetY()) * 0.1f;
+        if (score < bestScore) {
+            bestScore = score; plan.valid = true; plan.moveDir = path.firstDir;
+            plan.shootDir = shootDir; plan.canShootNow = (path.steps == 0);
+            plan.goalX = cx; plan.goalY = cy; plan.score = score + 15.0f; found = true;
+        }
+        };
+
+    for (int x = tx - 1; x >= 1; --x) {
+        int b = ai->GetBlock(x, ty);
+        if (b == BLOCK_HARD_OBSTACLE || b == BLOCK_BASE || b == BLOCK_OUT_OF_BOARD) break;
+        if (TankBodyAt(ai, myId, x, ty)) break;
+        tryBreakCell(x, ty);
+    }
+    for (int x = tx + 1; x < MAP_W - 1; ++x) {
+        int b = ai->GetBlock(x, ty);
+        if (b == BLOCK_HARD_OBSTACLE || b == BLOCK_BASE || b == BLOCK_OUT_OF_BOARD) break;
+        if (TankBodyAt(ai, myId, x, ty)) break;
+        tryBreakCell(x, ty);
+    }
+    for (int y = ty - 1; y >= 1; --y) {
+        int b = ai->GetBlock(tx, y);
+        if (b == BLOCK_HARD_OBSTACLE || b == BLOCK_BASE || b == BLOCK_OUT_OF_BOARD) break;
+        if (TankBodyAt(ai, myId, tx, y)) break;
+        tryBreakCell(tx, y);
+    }
+    for (int y = ty + 1; y < MAP_H - 1; ++y) {
+        int b = ai->GetBlock(tx, y);
+        if (b == BLOCK_HARD_OBSTACLE || b == BLOCK_BASE || b == BLOCK_OUT_OF_BOARD) break;
+        if (TankBodyAt(ai, myId, tx, y)) break;
+        tryBreakCell(tx, y);
+    }
+    return found;
+}
+
+// ============================================================
+// BuildPlanForEnemy — Fire → WallBreak → Chase → Chase(ignoreRes)
+// ============================================================
+static bool BuildPlanForEnemy(AI* ai, int myId, Tank* mine, int enemyId,
+    bool res[MAP_H][MAP_W], HuntPlan& plan) {
+    Tank* target = ai->GetEnemyTank(enemyId);
+    if (!target || target->GetHP() <= 0) return false;
+    plan = { false, enemyId, 0, 0, false, ToCell(mine->GetX()), ToCell(mine->GetY()), INF };
+
+    if (FindBestFireGoalSafe(ai, myId, mine, target, res, plan)) {
+        // ok
+    }
+    else if (!FindWallBreakGoal(ai, myId, mine, target, res, plan)) {
+        // Thử chase với reserved, nếu fail thì ignore reserved
+        if (!FindBestChaseGoalSafe(ai, myId, mine, target, res, plan, false)) {
+            if (!FindBestChaseGoalSafe(ai, myId, mine, target, res, plan, true))
+                return false;
+            plan.score += 5.0f; // nhỏ, chấp nhận va nhẹ teammate
+        }
+        plan.score += 20.0f;
+    }
+
+    float dist = Distance(mine->GetX(), mine->GetY(), target->GetX(), target->GetY());
+    plan.score += dist * 0.35f;
+    if (target->GetHP() <= 60) plan.score -= 10.0f;
+    return true;
+}
+
+// ============================================================
+// FIX VẤN ĐỀ 1: ChooseEnemyPlan — KHÔNG BAO GIỜ skip enemy duy nhất
+//
+// Logic mới rõ ràng hơn:
+//   Bước 1: Nếu có enemy đang trong tầm bắn NGAY LẬP TỨC → ưu tiên tuyệt đối
+//   Bước 2: Thử assigned enemy (preferred)
+//   Bước 3: Fallback tìm TẤT CẢ enemy (kể cả preferred)
+//           → đây là fix chính: không skip preferred trong fallback
+// ============================================================
+static int g_assignedEnemy[NUMBER_OF_TANK] = { -1, -1, -1, -1 };
+
+static void RefreshEnemyAssignment(AI* ai) {
+    int aliveEnemies[NUMBER_OF_TANK]; int aliveCount = 0;
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* e = ai->GetEnemyTank(i);
+        if (e && e->GetHP() > 0) aliveEnemies[aliveCount++] = i;
+    }
+    if (aliveCount == 0) return;
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* mine = ai->GetMyTank(i);
+        if (!mine || mine->GetHP() <= 0) continue;
+        if (g_assignedEnemy[i] >= 0) {
+            Tank* a = ai->GetEnemyTank(g_assignedEnemy[i]);
+            if (a && a->GetHP() > 0) continue;
+        }
+        g_assignedEnemy[i] = aliveEnemies[(i + g_tick / 30) % aliveCount];
+    }
+}
+
+static bool ChooseEnemyPlan(AI* ai, int myId, Tank* mine,
+    bool res[MAP_H][MAP_W], HuntPlan& best) {
+    best = { false, 0, 0, 0, false, 0, 0, INF };
+
+    // ── Bước 1: bắn NGAY nếu có enemy trong tầm ────────────
+    for (int eId = 0; eId < NUMBER_OF_TANK; ++eId) {
+        Tank* enemy = ai->GetEnemyTank(eId);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+        if (ClearShotDirection(ai, myId, mine->GetX(), mine->GetY(), enemy) == 0) continue;
+        HuntPlan sp;
+        if (BuildPlanForEnemy(ai, myId, mine, eId, res, sp)) {
+            sp.score -= 50.0f; // ưu tiên cao nhất
+            if (!best.valid || sp.score < best.score) best = sp;
+        }
+    }
+    if (best.valid) return true;
+
+    // ── Bước 2: assigned enemy ──────────────────────────────
+    int preferred = g_assignedEnemy[myId];
+    if (preferred >= 0) {
+        HuntPlan pp;
+        if (BuildPlanForEnemy(ai, myId, mine, preferred, res, pp)) {
+            best = pp;
+            return true;
+        }
+    }
+
+    // ── Bước 3: FIX VẤN ĐỀ 1 — tìm MỌI enemy, KHÔNG skip preferred ──
+    // Trường hợp điển hình: chỉ còn 1 địch = preferred nhưng bước 2 fail
+    // vì reserved. Bước này sẽ dùng ignoreReserved fallback bên trong.
+    for (int eId = 0; eId < NUMBER_OF_TANK; ++eId) {
+        HuntPlan p;
+        if (!BuildPlanForEnemy(ai, myId, mine, eId, res, p)) continue;
+        if (!best.valid || p.score < best.score) best = p;
+    }
+    return best.valid;
+}
+
+static int CountAliveEnemies(AI* ai) {
+    int n = 0;
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* e = ai->GetEnemyTank(i);
+        if (e && e->GetHP() > 0) ++n;
+    }
+    return n;
+}
+
+static Tank* FindVisibleShotTarget(AI* ai, int myId, Tank* mine, int& shotDir) {
+    Tank* best = NULL; float bestD = INF; shotDir = 0;
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* enemy = ai->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+        int dir = ClearShotDirection(ai, myId, mine->GetX(), mine->GetY(), enemy);
+        if (dir == 0) continue;
+        float d2 = DistSq(mine->GetX(), mine->GetY(), enemy->GetX(), enemy->GetY());
+        if (!best || d2 < bestD) { bestD = d2; best = enemy; shotDir = dir; }
+    }
+    return best;
+}
+
+// ============================================================
+// FIX VẤN ĐỀ 4: ScoutDirection — ưu tiên đi về phía địch trước
+// ============================================================
+static int ScoutDirection(AI* ai, int myId, Tank* mine, bool res[MAP_H][MAP_W]) {
+    // Tìm địch gần nhất còn sống → đi thẳng về phía đó
+    float closestDist = INF;
+    int   closestEx = -1, closestEy = -1;
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* enemy = ai->GetEnemyTank(i);
+        if (!enemy || enemy->GetHP() <= 0) continue;
+        float d = Distance(mine->GetX(), mine->GetY(), enemy->GetX(), enemy->GetY());
+        if (d < closestDist) {
+            closestDist = d;
+            closestEx = ToCell(enemy->GetX());
+            closestEy = ToCell(enemy->GetY());
+        }
+    }
+    if (closestEx >= 0) {
+        // Thử BFS bình thường trước
+        PathInfo p = FindPath(ai, myId, mine, closestEx, closestEy, res);
+        if (p.found && p.firstDir != 0) return p.firstDir;
+        // Greedy với reserved
+        int d = BestImmediateStep(ai, myId, mine, closestEx, closestEy, res);
+        if (d != 0) return d;
+        // Greedy bỏ qua reserved
+        d = BestImmediateStepIgnoreReserved(ai, myId, mine, closestEx, closestEy);
+        if (d != 0) return d;
+    }
+
+    // Điểm scout cố định (backup)
+    Cell scouts[8] = { {10,2},{10,19},{2,10},{19,10},{6,6},{15,6},{6,15},{15,15} };
+    for (int k = 0; k < 8; ++k) {
+        int idx = (myId + k + g_tick / 80) % 8;
+        PathInfo path = FindPath(ai, myId, mine, scouts[idx].x, scouts[idx].y, res);
+        if (path.found && path.firstDir != 0) return path.firstDir;
+    }
+
+    // Fallback tuyệt đối: bất kỳ hướng nào đi được
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    for (int i = 0; i < 4; ++i) {
+        int d = dirs[(myId + i + g_tick) % 4];
+        int dx, dy; DirectionDelta(d, dx, dy);
+        int nx = ToCell(mine->GetX()) + dx, ny = ToCell(mine->GetY()) + dy;
+        if (CanStand(ai, myId, nx, ny)) return d;
+    }
+    return mine->GetDirection();
+}
+
+// ============================================================
+// STRIKE DANGER
+// ============================================================
+static float StrikeDanger(AI* ai, float x, float y) {
+    std::vector<Strike*> strikes = ai->GetIncomingStrike();
+    float danger = 0.0f;
+    for (int i = 0; i < (int)strikes.size(); ++i) {
+        Strike* s = strikes[i];
+        if (!s || !s->IsAlive() || s->GetCountDown() > 15) continue;
+        float d2 = DistSq(x, y, s->GetX(), s->GetY());
+        if (d2 <= 9.0f)  danger += 100.0f;
+        else if (d2 <= 16.0f) danger += 20.0f;
+    }
+    return danger;
+}
+static int EscapeStrikeDirection(AI* ai, int myId, Tank* mine, bool res[MAP_H][MAP_W]) {
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    int bestDir = 0; float bestScore = StrikeDanger(ai, mine->GetX(), mine->GetY());
+    for (int i = 0; i < 4; ++i) {
+        int dx, dy; DirectionDelta(dirs[i], dx, dy);
+        int nx = sx + dx, ny = sy + dy;
+        if (!CanStand(ai, myId, nx, ny)) continue;
+        if (Reserved(res, nx, ny)) continue;
+        float score = StrikeDanger(ai, (float)nx, (float)ny);
+        if (score < bestScore) { bestScore = score; bestDir = dirs[i]; }
+    }
+    return bestDir;
+}
+
+// ============================================================
+// BULLET DODGE
+// ============================================================
+static std::vector<BulletThreat> DetectBulletThreatsForTank(AI* ai, Tank* mine) {
+    std::vector<BulletThreat> threats;
+    auto bullets = ai->GetEnemyBullets();
+    float myX = mine->GetX(), myY = mine->GetY();
+    for (auto* b : bullets) {
+        if (!b || !b->IsAlive()) continue;
+        float bx = b->GetX(), by = b->GetY();
+        int dir = b->GetDirection(); float spd = b->GetSpeed();
+        if (spd < 0.01f) continue;
+        int ddx, ddy; DirectionDelta(dir, ddx, ddy);
+        float dot = (myX - bx) * ddx + (myY - by) * ddy;
+        if (dot <= 0.0f) continue;
+        float fx = bx, fy = by;
+        for (int t = 1; t <= 30; ++t) {
+            fx += ddx * spd; fy += ddy * spd;
+            if (fx < 0 || fx >= MAP_W || fy < 0 || fy >= MAP_H) break;
+            if (DistSq(myX, myY, fx, fy) < 1.44f) {
+                threats.push_back({ bx, by, spd, dir, (float)t });
+                break;
+            }
+            int cx = ClampInt((int)(fx + 0.5f), 0, MAP_W - 1);
+            int cy = ClampInt((int)(fy + 0.5f), 0, MAP_H - 1);
+            int block = ai->GetBlock(cx, cy);
+            if (block == BLOCK_HARD_OBSTACLE || block == BLOCK_SOFT_OBSTACLE) break;
+        }
+    }
+    std::sort(threats.begin(), threats.end(),
+        [](const BulletThreat& a, const BulletThreat& b) { return a.timeToHit < b.timeToHit; });
+    return threats;
+}
+static int ChooseBulletEscapeDirSafe(AI* ai, int myId, Tank* mine,
+    const std::vector<BulletThreat>& threats,
+    bool res[MAP_H][MAP_W]) {
+    if (threats.empty()) return 0;
+    int sx = ToCell(mine->GetX()), sy = ToCell(mine->GetY());
+    int dirs[4] = { DIRECTION_UP, DIRECTION_RIGHT, DIRECTION_DOWN, DIRECTION_LEFT };
+    int bestDir = 0; float bestScore = -INF;
+    for (int i = 0; i < 4; ++i) {
+        int dir = dirs[i]; int dx, dy; DirectionDelta(dir, dx, dy);
+        int nx = sx + dx, ny = sy + dy;
+        if (!CanStand(ai, myId, nx, ny)) continue;
+        if (Reserved(res, nx, ny)) continue;
+        float score = 0.0f;
+        for (int k = 0; k < (int)threats.size(); ++k) {
+            const BulletThreat& t = threats[k];
+            int bdx, bdy; DirectionDelta(t.bulletDir, bdx, bdy);
+            float minD2 = INF, bx = t.bulletX, by = t.bulletY;
+            for (int tt = 1; tt <= 10; ++tt) {
+                bx += bdx * t.bulletSpeed; by += bdy * t.bulletSpeed;
+                float d2 = DistSq((float)nx, (float)ny, bx, by);
+                if (d2 < minD2) minD2 = d2;
+            }
+            if (minD2 < 1.44f) score -= 1000.0f / (1.0f + t.timeToHit);
+            else                score += minD2 * 0.25f;
+            bool perp = ((t.bulletDir == DIRECTION_UP || t.bulletDir == DIRECTION_DOWN) &&
+                (dir == DIRECTION_LEFT || dir == DIRECTION_RIGHT)) ||
+                ((t.bulletDir == DIRECTION_LEFT || t.bulletDir == DIRECTION_RIGHT) &&
+                    (dir == DIRECTION_UP || dir == DIRECTION_DOWN));
+            if (perp) score += 80.0f / (1.0f + t.timeToHit);
+            else      score -= 25.0f / (1.0f + t.timeToHit);
+        }
+        if (score > bestScore) { bestScore = score; bestDir = dir; }
+    }
+    return bestDir;
+}
+
+// ============================================================
+// PLACEMENT
+// ============================================================
+void AI_Placement() {
+    AI* p_AI = AI::GetInstance();
+    if (p_AI->GetMyTeam() == TEAM_1) {
+        Game::PlaceTank(TANK_LIGHT, 1, 6);
+        Game::PlaceTank(TANK_LIGHT, 7, 7);
+        Game::PlaceTank(TANK_LIGHT, 2, 14);
+        Game::PlaceTank(TANK_LIGHT, 5, 18);
+    }
+    else {
+        Game::PlaceTank(TANK_LIGHT, 20, 1);
+        Game::PlaceTank(TANK_LIGHT, 17, 7);
+        Game::PlaceTank(TANK_LIGHT, 16, 15);
+        Game::PlaceTank(TANK_LIGHT, 16, 20);
+    }
+}
+
+// ============================================================
+// AI UPDATE
+// ============================================================
+void AI_Update() {
+    AI* p_AI = AI::GetInstance();
+    ++g_tick;
+
+    RefreshEnemyAssignment(p_AI);
+
+    // ── CẬP NHẬT TRẠNG THÁI PHÒNG THỦ BASE ─────────────────
+    UpdateBaseDefenseState(p_AI);
+
+    bool reserved[MAP_H][MAP_W] = {};
+    static float lastX[NUMBER_OF_TANK] = { -1,-1,-1,-1 };
+    static float lastY[NUMBER_OF_TANK] = { -1,-1,-1,-1 };
+    static int   stuckCounter[NUMBER_OF_TANK] = {};
+
+    for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+        Tank* myTank = p_AI->GetMyTank(i);
+        if (!myTank || myTank->GetHP() <= 0) continue;
+
+        if (lastX[i] >= 0 &&
+            DistSq(myTank->GetX(), myTank->GetY(), lastX[i], lastY[i]) < 0.01f)
+            ++stuckCounter[i];
+        else stuckCounter[i] = 0;
+        lastX[i] = myTank->GetX(); lastY[i] = myTank->GetY();
+
+        if (myTank->IsDisabled()) {
+            CommandTankReserved(i, myTank, myTank->GetDirection(), false, false, reserved);
+            continue;
+        }
+
+        // ── P1: Né Airstrike ─────────────────────────────────
+        int escapeStrikeDir = EscapeStrikeDirection(p_AI, i, myTank, reserved);
+        if (escapeStrikeDir != 0) {
+            int ls = 0; FindVisibleShotTarget(p_AI, i, myTank, ls);
+            bool shoot = (ls == escapeStrikeDir && myTank->GetCoolDown() == 0);
+            CommandTankReserved(i, myTank, escapeStrikeDir, true, shoot, reserved);
+            continue;
+        }
+
+        // ── P2: Né đạn thường ────────────────────────────────
+        auto bulletThreats = DetectBulletThreatsForTank(p_AI, myTank);
+        bool bulletDanger = !bulletThreats.empty() && bulletThreats[0].timeToHit <= 8.0f;
+        if (bulletDanger) {
+            int beDir = ChooseBulletEscapeDirSafe(p_AI, i, myTank, bulletThreats, reserved);
+            if (beDir != 0) {
+                int ls = 0; FindVisibleShotTarget(p_AI, i, myTank, ls);
+                bool shoot = (ls == beDir && myTank->GetCoolDown() == 0);
+                CommandTankReserved(i, myTank, beDir, true, shoot, reserved);
+                continue;
+            }
+        }
+
+        // ── P3: BASE DEFENSE (ý tưởng mới) ──────────────────
+        // Nếu địch đang tấn công base → tất cả tank bỏ mọi thứ,
+        // dồn về tiêu diệt kẻ tấn công ngay lập tức
+        HuntPlan plan;
+        if (g_baseUnderAttack && g_baseAttackerEnemyId >= 0) {
+            Tank* attacker = p_AI->GetEnemyTank(g_baseAttackerEnemyId);
+            if (attacker && attacker->GetHP() > 0) {
+                HuntPlan defensePlan;
+                if (BuildPlanForEnemy(p_AI, i, myTank, g_baseAttackerEnemyId,
+                    reserved, defensePlan)) {
+                    // Score cực thấp → override mọi plan khác
+                    defensePlan.score -= 200.0f;
+                    plan = defensePlan;
+                    plan.valid = true;
+                    // Ghi đè assignment: tank này tạm thời nhắm vào attacker
+                    goto execute_plan;
+                }
+            }
+            else {
+                // Attacker đã chết, tắt defense mode ngay
+                g_baseUnderAttack = false;
+                g_baseAttackerEnemyId = -1;
+            }
+        }
+
+        // ── P4: Kế hoạch săn địch bình thường ───────────────
+        if (!ChooseEnemyPlan(p_AI, i, myTank, reserved, plan)) {
+            if (CountAliveEnemies(p_AI) == 0) {
+                CommandTankReserved(i, myTank, myTank->GetDirection(), false, false, reserved);
+                continue;
+            }
+            int scoutDir = ScoutDirection(p_AI, i, myTank, reserved);
+            CommandTankReserved(i, myTank, scoutDir, true, false, reserved);
+            continue;
+        }
+
+    execute_plan:
+        {
+            Tank* target = p_AI->GetEnemyTank(plan.enemyId);
+            if (!target) {
+                CommandTankReserved(i, myTank, myTank->GetDirection(), false, false, reserved);
+                continue;
+            }
+
+            // ── Bắn tường (wall-break plan) ──────────────────
+            if (plan.canShootNow && plan.shootDir != 0) {
+                int liveDir = ClearShotDirection(p_AI, i, myTank->GetX(), myTank->GetY(), target);
+                if (liveDir == 0 && myTank->GetCoolDown() == 0) {
+                    CommandTankReserved(i, myTank, plan.shootDir, false, true, reserved);
+                    continue;
+                }
+            }
+
+            // ── Bắn nếu đang ngắm địch ───────────────────────
+            int liveShootDir = ClearShotDirection(p_AI, i, myTank->GetX(), myTank->GetY(), target);
+            if (liveShootDir != 0) {
+                bool cooldownReady = (myTank->GetCoolDown() == 0);
+                int rollX, rollY; bool rollForward = false;
+                if (CanMoveDirection(p_AI, i, myTank, liveShootDir, reserved, rollX, rollY)) {
+                    float cur2 = DistSq(myTank->GetX(), myTank->GetY(), target->GetX(), target->GetY());
+                    float next2 = DistSq((float)rollX, (float)rollY, target->GetX(), target->GetY());
+                    rollForward = (next2 < cur2 - 0.1f);
+                }
+                if (cooldownReady) {
+                    CommandTankReserved(i, myTank, liveShootDir, rollForward, true, reserved);
+                    continue;
+                }
+                // Chờ cooldown: di chuyển về goal
+                if (plan.moveDir != 0 &&
+                    (plan.goalX != ToCell(myTank->GetX()) || plan.goalY != ToCell(myTank->GetY()))) {
+                    int safeMove = ResolveMove(p_AI, i, myTank, plan.moveDir,
+                        plan.goalX, plan.goalY, reserved,
+                        stuckCounter[i] > 8);
+                    if (safeMove != 0) {
+                        CommandTankReserved(i, myTank, safeMove, true, false, reserved);
+                        continue;
+                    }
+                }
+                CommandTankReserved(i, myTank, liveShootDir, rollForward, false, reserved);
+                continue;
+            }
+
+            // ── Di chuyển đến vị trí bắn ─────────────────────
+            int moveDir = ResolveMove(p_AI, i, myTank, plan.moveDir,
+                plan.goalX, plan.goalY, reserved,
+                stuckCounter[i] > 8);
+            if (moveDir != 0) {
+                CommandTankReserved(i, myTank, moveDir, true, false, reserved);
+            }
+            else {
+                // Không tìm được hướng → quay về phía địch
+                float dx = target->GetX() - myTank->GetX();
+                float dy = target->GetY() - myTank->GetY();
+                int faceDir = AbsF(dx) > AbsF(dy)
+                    ? (dx > 0.0f ? DIRECTION_RIGHT : DIRECTION_LEFT)
+                    : (dy > 0.0f ? DIRECTION_DOWN : DIRECTION_UP);
+                CommandTankReserved(i, myTank, faceDir, false, false, reserved);
+            }
+        }
+    } // end for each tank
+
+    // ── POWER-UP: AIRSTRIKE ────────────────────────────────────
+    if (p_AI->HasAirstrike()) {
+        float bestX = 0, bestY = 0; bool hasTarget = false; float bestScore = -INF;
+        for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+            bool friendlyClose = false;
+            for (int k = 0; k < NUMBER_OF_TANK; ++k) {
+                Tank* mine = p_AI->GetMyTank(k);
+                if (!mine || mine->GetHP() <= 0) continue;
+                if (Distance(mine->GetX(), mine->GetY(), enemy->GetX(), enemy->GetY()) < 3.2f)
+                {
+                    friendlyClose = true; break;
+                }
+            }
+            if (friendlyClose) continue;
+            float score = (100 - enemy->GetHP()) * 0.5f;
+            for (int j = 0; j < NUMBER_OF_TANK; ++j) {
+                Tank* other = p_AI->GetEnemyTank(j);
+                if (!other || other->GetHP() <= 0 || i == j) continue;
+                float d = Distance(enemy->GetX(), enemy->GetY(), other->GetX(), other->GetY());
+                if (d < 3.5f) score += 30.0f;
+                else if (d < 6.0f) score += 10.0f;
+            }
+            int ex = ToCell(enemy->GetX()), ey = ToCell(enemy->GetY());
+            int dirs4[4] = { DIRECTION_UP,DIRECTION_RIGHT,DIRECTION_DOWN,DIRECTION_LEFT };
+            int escapeRoutes = 0;
+            for (int d = 0; d < 4; ++d) {
+                int ddx, ddy; DirectionDelta(dirs4[d], ddx, ddy);
+                if (p_AI->GetBlock(ex + ddx, ey + ddy) == BLOCK_GROUND) ++escapeRoutes;
+            }
+            score += (4 - escapeRoutes) * 8.0f;
+            // Thưởng thêm nếu địch đang tấn công base mình → tiêu diệt ưu tiên
+            if (g_baseUnderAttack && i == g_baseAttackerEnemyId) score += 40.0f;
+            if (!hasTarget || score > bestScore) {
+                bestScore = score; bestX = enemy->GetX(); bestY = enemy->GetY(); hasTarget = true;
+            }
+        }
+        if (hasTarget) p_AI->UseAirstrike(bestX, bestY);
+    }
+    // ── POWER-UP: EMP ─────────────────────────────────────────
+    else if (p_AI->HasEMP()) {
+        Tank* bestTarget = nullptr; float bestScore = -INF;
+        for (int i = 0; i < NUMBER_OF_TANK; ++i) {
+            Tank* enemy = p_AI->GetEnemyTank(i);
+            if (!enemy || enemy->GetHP() <= 0) continue;
+            float score = enemy->GetHP() * 0.2f;
+            for (int k = 0; k < NUMBER_OF_TANK; ++k) {
+                Tank* mine = p_AI->GetMyTank(k);
+                if (!mine || mine->GetHP() <= 0) continue;
+                if (ClearShotDirection(p_AI, k, enemy->GetX(), enemy->GetY(), mine) != 0)
+                    score += 60.0f + (100 - mine->GetHP()) * 0.3f;
+                if (Distance(mine->GetX(), mine->GetY(), enemy->GetX(), enemy->GetY()) < 5.0f)
+                    score += 15.0f;
+            }
+            // Thưởng: địch đang tấn công base → EMP nó trước
+            if (g_baseUnderAttack && i == g_baseAttackerEnemyId) score += 50.0f;
+            if (score > bestScore) { bestScore = score; bestTarget = enemy; }
+        }
+        if (bestTarget) p_AI->UseEMP(bestTarget->GetX(), bestTarget->GetY());
+    }
+
+    Game::GetInstance()->SendCommand();
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+int main(int argc, char* argv[]) {
+    srand((unsigned)time(nullptr));
+#ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData)) { printf("WSAStartup Failed.\n"); return 1; }
+#endif
+    Game::CreateInstance();
+    Game* p_Game = Game::GetInstance();
+    if (p_Game->Connect(argc, argv) == -1) { LOG("Failed to connect!\n"); return -1; }
+    AI::GetInstance()->PlaceTank = &AI_Placement;
+    AI::GetInstance()->Update = &AI_Update;
+    p_Game->PollingFromServer();
+    Game::DestroyInstance();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
+}
